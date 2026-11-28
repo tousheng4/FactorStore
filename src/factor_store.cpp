@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <mutex>
@@ -25,6 +26,7 @@ using BlockKey = std::uint64_t;
 
 constexpr std::size_t max_days_in_year = 366;
 constexpr std::size_t dense_threshold = 192;
+constexpr std::size_t min_dense_run_days = 5;
 constexpr std::size_t max_promotions_per_daily_batch = 256;
 constexpr std::size_t cells_per_promotion = 16;
 constexpr DayIndex empty_day = static_cast<DayIndex>(max_days_in_year);
@@ -134,6 +136,12 @@ struct QueryDay {
     std::size_t position;
 };
 
+struct QueryRun {
+    DayIndex day;
+    std::size_t position;
+    std::size_t length;
+};
+
 struct QueryDays {
     void add(DayIndex day, std::size_t position) {
         if (!days.empty() && day < days.back().day) {
@@ -152,8 +160,36 @@ struct QueryDays {
         }
     }
 
+    void plan_dense_reads() {
+        if (days.size() < min_dense_run_days) {
+            return;
+        }
+        std::size_t first_point = 0;
+        for (std::size_t begin = 0; begin < days.size();) {
+            std::size_t end = begin + 1;
+            while (end < days.size() &&
+                   days[end].day == days[end - 1].day + 1 &&
+                   days[end].position == days[end - 1].position + 1) {
+                ++end;
+            }
+            if (end - begin >= min_dense_run_days) {
+                dense_points.insert(dense_points.end(), days.begin() + first_point,
+                                    days.begin() + begin);
+                dense_runs.push_back({days[begin].day, days[begin].position, end - begin});
+                first_point = end;
+            }
+            begin = end;
+        }
+        if (!dense_runs.empty()) {
+            dense_points.insert(dense_points.end(), days.begin() + first_point, days.end());
+        }
+    }
+
     std::vector<QueryDay> days;
     bool sorted = true;
+    // Sparse reads may reorder days. The dense plan retains the original positions.
+    std::vector<QueryRun> dense_runs;
+    std::vector<QueryDay> dense_points;
 };
 
 void set_query_value(QueryResult& result, std::size_t position, double value) noexcept {
@@ -163,11 +199,26 @@ void set_query_value(QueryResult& result, std::size_t position, double value) no
 
 struct DenseBlock {
     std::array<double, max_days_in_year> values{};
-    std::bitset<max_days_in_year> present;
+    std::array<std::uint64_t, (max_days_in_year + 63) / 64> present{};
 
     void upsert(DayIndex day, double value) noexcept {
         values[day] = value;
-        present[day] = true;
+        present[day / 64] |= std::uint64_t{1} << (day % 64);
+    }
+
+    [[nodiscard]] bool has_value(DayIndex day) const noexcept {
+        return (present[day / 64] & (std::uint64_t{1} << (day % 64))) != 0;
+    }
+
+    // Return up to 64 consecutive validity bits starting at the least significant bit.
+    [[nodiscard]] std::uint64_t read_mask(std::size_t day, std::size_t count) const noexcept {
+        const auto word = day / 64;
+        const auto bit = day % 64;
+        auto mask = present[word] >> bit;
+        if (count > 64 - bit) {
+            mask |= present[word + 1] << (64 - bit);
+        }
+        return mask & (~std::uint64_t{0} >> (64 - count));
     }
 };
 
@@ -209,7 +260,7 @@ public:
     void read_one(DayIndex day, std::size_t position, QueryResult& result) const {
         if (const auto* owner = std::get_if<DenseOwner>(&storage_)) {
             const DenseBlock& dense = **owner;
-            if (dense.present[day]) {
+            if (dense.has_value(day)) {
                 set_query_value(result, position, dense.values[day]);
             }
         } else if (const auto* single = std::get_if<IndexedValue>(&storage_)) {
@@ -223,7 +274,14 @@ public:
 
     void read_many(QueryDays& requested, std::size_t offset, QueryResult& result) const {
         if (const auto* owner = std::get_if<DenseOwner>(&storage_)) {
-            read_dense(**owner, requested.days, offset, result);
+            if (requested.dense_runs.empty()) {
+                read_dense_points(**owner, requested.days, offset, result);
+            } else {
+                for (const auto& run : requested.dense_runs) {
+                    read_dense_run(**owner, run, offset, result);
+                }
+                read_dense_points(**owner, requested.dense_points, offset, result);
+            }
             return;
         }
         if (const auto* single = std::get_if<IndexedValue>(&storage_)) {
@@ -338,12 +396,27 @@ public:
 private:
     friend class PromotionQueue;
 
-    static void read_dense(const DenseBlock& dense, const std::vector<QueryDay>& requested,
-                           std::size_t offset, QueryResult& result) noexcept {
+    static void read_dense_run(const DenseBlock& dense, const QueryRun& run,
+                               std::size_t offset, QueryResult& result) noexcept {
+        const auto start = offset + run.position;
+        std::memcpy(result.values.data() + start, dense.values.data() + run.day,
+                    run.length * sizeof(double));
+        for (std::size_t copied = 0; copied < run.length;) {
+            const auto output = start + copied;
+            const auto bit = output % 64;
+            const auto count = std::min(run.length - copied, 64 - bit);
+            const auto mask = dense.read_mask(run.day + copied, count);
+            result.validity[output / 64] |= mask << bit;
+            copied += count;
+        }
+    }
+
+    static void read_dense_points(const DenseBlock& dense, const std::vector<QueryDay>& requested,
+                                  std::size_t offset, QueryResult& result) noexcept {
         auto word = offset / 64;
         std::uint64_t mask = 0;
         for (const auto& request : requested) {
-            if (dense.present[request.day]) {
+            if (dense.has_value(request.day)) {
                 const auto position = offset + request.position;
                 result.values[position] = dense.values[request.day];
                 const auto next_word = position / 64;
@@ -782,6 +855,9 @@ QueryResult FactorStore::query(const std::vector<std::string>& factors,
         for (std::size_t d = 0; d < dates.size(); ++d) {
             const auto date = parse_date(dates[d]);
             by_year[date.year].add(date.day, d);
+        }
+        for (auto& entry : by_year) {
+            entry.second.plan_dense_reads();
         }
     }
 

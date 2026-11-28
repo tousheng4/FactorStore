@@ -167,10 +167,14 @@ void test_promotion_during_writes_to_other_factors() {
     const std::array<int, 7> days_per_month{31, 29, 31, 30, 31, 30, 10};
     constexpr TradingDate last_day = 20240710;
     const std::vector<double> original(codes.size(), 1.0);
+    std::vector<TradingDate> requested{date};
     for (std::size_t month = 0; month < days_per_month.size(); ++month) {
         for (int day = 1; day <= days_per_month[month]; ++day) {
             const auto trading_date = 20240000 + static_cast<int>(month + 1) * 100 + day;
             store.upsert_day(trading_date, pending, codes, original);
+            if (trading_date >= 20240624) {
+                requested.push_back(trading_date);
+            }
         }
     }
     store.upsert_day(date, active, codes, original);
@@ -186,13 +190,16 @@ void test_promotion_during_writes_to_other_factors() {
     start.set_value();
     for (int i = 0; i < iterations; ++i) {
         store.upsert_day(date, active, codes, original);
-        const auto result = store.query(pending, codes, {date, last_day});
+        const auto result = store.query(pending, codes, requested);
         for (std::size_t c = 0; c < codes.size(); ++c) {
-            const auto first = c * 2;
-            check(result.has_value(first) && result.values[first] == 1.0 &&
-                      result.has_value(first + 1) &&
-                      (result.values[first + 1] == 1.0 || result.values[first + 1] == 2.0),
-                  "queued promotion lost sparse or overwritten values");
+            const auto first = c * requested.size();
+            const auto last = first + requested.size() - 1;
+            for (auto index = first; index < last; ++index) {
+                check(result.has_value(index) && result.values[index] == 1.0,
+                      "queued promotion lost an unchanged value");
+            }
+            check(result.has_value(last) && (result.values[last] == 1.0 || result.values[last] == 2.0),
+                  "queued promotion lost an overwritten value");
         }
     }
     annual.get();

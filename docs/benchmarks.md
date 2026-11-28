@@ -339,3 +339,47 @@ done
 ```
 
 Release CTest 四项通过，并发用例连续运行 20 次。单元和并发用例通过 ASan 与 UBSan，并发用例通过 TSan。新增查询用例检查跨年份和相邻合约共用位图字、重复日期以及单日查询中的缺失和 NaN。
+
+## 稠密块连续段读取
+
+三个新场景共用同一份数据。每个年度块在 2024 年前 256 个自然日内写入 224 日，每 8 个自然日跳过一天。三个场景都请求 128 个日期，命中 112 项。CSV 中的缺失率按整数截断为 12%。
+
+- `query-dense-calendar` 请求前 128 个自然日。
+- `query-dense-weekdays` 请求前 128 个星期一至星期五的日期。
+- `query-dense-shuffled` 请求与自然日场景相同的日期，将顺序按固定种子打乱。
+
+以 `6384c32` 为基线，用同一份基准代码比较最短连续段为 5 日和 8 日的版本。源日序号和结果位置都连续时才可成段读取。测试在 WSL2、AMD Ryzen 9 7940H 和 GCC 13.3.0 上执行，编译选项为 `-O3 -DNDEBUG`，固定在逻辑 CPU 4。各场景轮换版本顺序运行七轮，每轮 61 次查询。表中是各轮 P50 和 P95 的中位数，单位为 µs。
+
+| 规模 | 场景 | 基线 P50 / P95 | 5 日 P50 / P95 | 8 日 P50 / P95 |
+| --- | --- | ---: | ---: | ---: |
+| small | `query-dense-calendar` | 76.82 / 97.50 | 24.25 / 36.98 | 24.25 / 39.78 |
+| small | `query-dense-weekdays` | 72.64 / 96.30 | 67.98 / 91.57 | 72.24 / 93.39 |
+| small | `query-dense-shuffled` | 74.83 / 97.56 | 74.58 / 98.74 | 74.73 / 101.02 |
+| small | `query-history` | 40.30 / 56.94 | 31.53 / 39.29 | 40.25 / 54.86 |
+| small | `query-mixed-dense-25` | 59.91 / 95.92 | 60.32 / 95.22 | 59.42 / 101.91 |
+| large | `query-dense-calendar` | 2627.97 / 2984.86 | 1065.42 / 1426.64 | 1122.67 / 1726.44 |
+| large | `query-dense-weekdays` | 2676.78 / 3086.11 | 2598.28 / 2973.22 | 2719.21 / 3051.07 |
+| large | `query-dense-shuffled` | 3247.36 / 3679.79 | 3246.53 / 3692.43 | 3300.38 / 3678.82 |
+| large | `query-history` | 163.64 / 214.25 | 127.39 / 196.23 | 161.89 / 213.23 |
+| large | `query-mixed-dense-25` | 4106.19 / 4865.69 | 4190.57 / 4729.16 | 4098.56 / 4686.88 |
+
+采用 5 日门槛，因为它能覆盖完整一周的工作日。大规模连续自然日 P50 下降约 59%，跨年历史查询下降约 22%，宽表工作日查询下降约 3%。同一批自然日打乱顺序后，P50 基本持平。另一组 25% 缺失的乱序负载中，大规模 P50 上升约 2%，P95 下降约 3%。
+
+从仓库根目录复跑三个版本。可将 `large` 改为 `small`，并替换场景验证其他查询。
+
+```bash
+scratch=$(mktemp -d)
+git show 6384c32:src/factor_store.cpp > "$scratch/baseline.cpp"
+cp src/factor_store.cpp "$scratch/runs5.cpp"
+sed 's/min_dense_run_days = 5;/min_dense_run_days = 8;/' \
+  src/factor_store.cpp > "$scratch/runs8.cpp"
+for version in baseline runs5 runs8; do
+  g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
+    benchmarks/factor_store_benchmark.cpp "$scratch/$version.cpp" -o "$scratch/$version"
+  for scenario in query-dense-calendar query-dense-weekdays query-dense-shuffled; do
+    taskset -c 4 "$scratch/$version" --case "$scenario" --profile large --samples 61
+  done
+done
+```
+
+验证覆盖同一批请求中的连续段与重复点查、跨年份和跨位图字边界的缺失值，以及并发写入与稀疏转稠密期间的连续读取。

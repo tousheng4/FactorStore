@@ -24,6 +24,9 @@ set(expected_rows
     "query-mixed-dense-25,small,3,32768,224,25"
     "query-promotion-pending,small,3,16384,192,50"
     "query-promotion-drained,small,3,16384,192,50"
+    "query-dense-calendar,small,3,65536,224,12"
+    "query-dense-weekdays,small,3,65536,224,12"
+    "query-dense-shuffled,small,3,65536,224,12"
 )
 string(REPLACE "\r" "" output "${output}")
 foreach(row IN LISTS expected_rows)

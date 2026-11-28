@@ -41,7 +41,7 @@ bool is_concurrent_case(std::string_view name) {
            name == concurrent_dense_case || name == concurrent_day_case;
 }
 
-enum class Shape { annual, daily, history_query, day_query, mixed_query, promotion_query };
+enum class Shape { annual, daily, history_query, day_query, mixed_query, promotion_query, dense_runs };
 
 struct Scenario {
     std::string_view name;
@@ -51,7 +51,7 @@ struct Scenario {
     bool drain_promotions = false;
 };
 
-constexpr std::array<Scenario, 15> scenarios{{
+constexpr std::array<Scenario, 18> scenarios{{
     {"year-new", Shape::annual, 0},
     {"year-overwrite", Shape::annual, days_per_year},
     {"year-backfill", Shape::annual, 189},
@@ -67,6 +67,9 @@ constexpr std::array<Scenario, 15> scenarios{{
     {"query-mixed-dense-25", Shape::mixed_query, 224, 8},
     {"query-promotion-pending", Shape::promotion_query, 192, 16},
     {"query-promotion-drained", Shape::promotion_query, 192, 16, true},
+    {"query-dense-calendar", Shape::dense_runs, 224},
+    {"query-dense-weekdays", Shape::dense_runs, 224},
+    {"query-dense-shuffled", Shape::dense_runs, 224},
 }};
 
 struct Options {
@@ -109,25 +112,28 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-std::vector<TradingDate> weekdays(int year, int weekday) {
+std::vector<TradingDate> year_days(int year, int weekday, bool weekdays_only = true) {
     // The fixtures only use 2024 and 2025. Monday is zero.
     const std::array<int, 12> month_lengths{
         31, year == 2024 ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
     };
     std::vector<TradingDate> dates;
-    dates.reserve(days_per_year);
+    dates.reserve(weekdays_only ? days_per_year : 366);
     for (std::size_t month = 0; month < month_lengths.size(); ++month) {
         for (int day = 1; day <= month_lengths[month]; ++day) {
-            if (weekday < 5) {
+            if (!weekdays_only || weekday < 5) {
                 dates.push_back(year * 10000 + (static_cast<int>(month) + 1) * 100 + day);
-                if (dates.size() == days_per_year) {
+                if (weekdays_only && dates.size() == days_per_year) {
                     return dates;
                 }
             }
             weekday = (weekday + 1) % 7;
         }
     }
-    throw std::runtime_error("calendar fixture has too few dates");
+    if (weekdays_only) {
+        throw std::runtime_error("calendar fixture has too few dates");
+    }
+    return dates;
 }
 
 std::vector<std::string> names(std::string_view prefix, std::size_t count) {
@@ -185,7 +191,7 @@ double microseconds_since(Clock::time_point start) {
 }
 
 Measurement annual(const Scenario& scenario, const Options& options) {
-    const auto dates = weekdays(2024, 0);
+    const auto dates = year_days(2024, 0);
     const auto values = generate_values(dates.size());
     const bool backfill = scenario.stored_days == 189;
     std::vector<DailyValue> initial;
@@ -225,7 +231,7 @@ Measurement annual(const Scenario& scenario, const Options& options) {
 Measurement daily(const Scenario& scenario, const Options& options,
                   const std::vector<std::string>& factors,
                   const std::vector<std::string>& contracts) {
-    const auto dates = weekdays(2024, 0);
+    const auto dates = year_days(2024, 0);
     const auto values = generate_values(factors.size() * contracts.size());
     const std::vector<double> initial(values.size(), -1.0);
     const auto date = dates[scenario.name == "day-overwrite" ? 0 : scenario.stored_days];
@@ -269,6 +275,22 @@ void build_query_year(const Scenario& scenario, const std::vector<TradingDate>& 
                        [offset](double value) { return value + offset; });
         store.upsert_day(date, factors, contracts, day_values);
     };
+    if (scenario.shape == Shape::dense_runs) {
+        // Jan 1 is Monday. Every eighth calendar date is missing in all three cases.
+        const bool weekdays_only = scenario.name == "query-dense-weekdays";
+        constexpr std::size_t loaded_span = 256;
+        constexpr std::size_t request_count = 128;
+        for (std::size_t i = 0; i < loaded_span; ++i) {
+            const bool present = i % 8 != 7;
+            if (present) {
+                load(year[i]);
+            }
+            if (requested.size() < request_count && (!weekdays_only || i % 7 < 5)) {
+                requested.push_back({year[i], present});
+            }
+        }
+        return;
+    }
     if (scenario.missing_dates_per_year == 0) {
         for (std::size_t i = 0; i < scenario.stored_days; ++i) {
             load(year[i]);
@@ -318,9 +340,11 @@ Measurement query(const Scenario& scenario, const Options& options,
                              ? std::vector<std::string>{all_factors.front()}
                              : all_factors;
     const auto values = generate_values(factors.size() * contracts.size());
-    const std::array<std::vector<TradingDate>, 2> years{weekdays(2024, 0), weekdays(2025, 2)};
+    const std::array<std::vector<TradingDate>, 2> years{
+        year_days(2024, 0, scenario.shape != Shape::dense_runs), year_days(2025, 2)};
     const bool single_year = scenario.shape == Shape::day_query ||
-                             scenario.shape == Shape::promotion_query;
+                             scenario.shape == Shape::promotion_query ||
+                             scenario.shape == Shape::dense_runs;
     const auto year_count = single_year ? 1U : years.size();
 
     FactorStore store;
@@ -328,7 +352,7 @@ Measurement query(const Scenario& scenario, const Options& options,
     for (std::size_t y = 0; y < year_count; ++y) {
         build_query_year(scenario, years[y], factors, contracts, values, store, requested);
     }
-    if (scenario.missing_dates_per_year != 0) {
+    if (scenario.missing_dates_per_year != 0 || scenario.name == "query-dense-shuffled") {
         permute(requested);
     }
     std::vector<TradingDate> dates;
@@ -405,7 +429,7 @@ void concurrent(const Options& options, const std::vector<std::string>& factors,
     const std::size_t stored_days = single_day ? 1 :
         (options.selected_case == concurrent_dense_case ? 224 : 64);
     const std::size_t requested_days = single_day ? 1 : 32;
-    const auto dates = weekdays(2024, 0);
+    const auto dates = year_days(2024, 0);
     const std::vector<TradingDate> requested(dates.begin(), dates.begin() + requested_days);
     const auto writer_factors = options.selected_case == disjoint_case
                                     ? names("writer_factor_", factors.size())

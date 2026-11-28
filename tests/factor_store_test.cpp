@@ -210,7 +210,10 @@ void test_query_bitmap_sharing_and_single_dates() {
     Model expected;
     for (const int year : {2000, 2004}) {
         std::vector<DailyValue> points;
-        for (std::size_t i = 0; i < 200; ++i) {
+        for (std::size_t i = 0; i < dates.size(); ++i) {
+            if ((i >= 200 && i < 340) || i == 63 || i == 64 || i == 127 || i == 365) {
+                continue;
+            }
             const auto date = dates[i] + (year - 2000) * 10000;
             const double value = i == 59 ? nan : static_cast<double>(i + year - 2000);
             points.push_back({date, value});
@@ -238,6 +241,16 @@ void test_query_bitmap_sharing_and_single_dates() {
     for (const auto day : samples) {
         compare_query(store, expected, factors, contracts, {day});
     }
+
+    // Mix long, unaligned runs with repeated point requests and two years.
+    std::vector<TradingDate> runs{dates.back(), 20040229, dates[4]};
+    runs.insert(runs.end(), dates.begin() + 13, dates.begin() + 143);
+    for (std::size_t i = 60; i < 141; ++i) {
+        runs.push_back(dates[i] + 40000);
+    }
+    runs.push_back(dates[59]);
+    runs.insert(runs.end(), dates.begin() + 340, dates.end());
+    compare_query(store, expected, factors, contracts, runs);
 }
 
 void test_pending_promotions_survive_writes_and_factor_deletion() {
