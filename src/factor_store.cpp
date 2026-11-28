@@ -27,6 +27,9 @@ using BlockKey = std::uint64_t;
 constexpr std::size_t max_days_in_year = 366;
 constexpr std::size_t dense_threshold = 192;
 constexpr std::size_t min_dense_run_days = 5;
+constexpr std::size_t min_scan_contracts = 64;
+constexpr std::size_t scan_probe_ratio = 4;
+constexpr std::size_t min_scan_savings_per_contract = 7;
 constexpr std::size_t max_promotions_per_daily_batch = 256;
 constexpr std::size_t cells_per_promotion = 16;
 constexpr DayIndex empty_day = static_cast<DayIndex>(max_days_in_year);
@@ -134,6 +137,26 @@ struct SparseBlock {
 struct QueryDay {
     DayIndex day;
     std::size_t position;
+};
+
+struct QueryContractPositions {
+    QueryContractPositions(const std::vector<std::optional<ContractId>>& contracts,
+                           std::size_t known_count)
+        : next(contracts.size(), contracts.size()) {
+        first.reserve(known_count);
+        for (std::size_t c = 0; c < contracts.size(); ++c) {
+            if (const auto contract = contracts[c]) {
+                auto [entry, inserted] = first.try_emplace(*contract, c);
+                if (!inserted) {
+                    next[c] = entry->second;
+                    entry->second = c;
+                }
+            }
+        }
+    }
+
+    std::unordered_map<ContractId, std::size_t> first;
+    std::vector<std::size_t> next;  // Chains all output positions for repeated contracts.
 };
 
 struct QueryRun {
@@ -871,11 +894,15 @@ QueryResult FactorStore::query(const std::vector<std::string>& factors,
     result.validity.resize(word_count);
 
     const std::shared_lock catalog_lock(impl_->catalog_mutex);
+    std::size_t known_contract_count = 0;
     for (const auto& contract : contracts) {
         const auto entry = impl_->contract_ids.find(contract);
-        contracts_by_position.push_back(entry == impl_->contract_ids.end()
-                                            ? std::nullopt
-                                            : std::optional<ContractId>(entry->second));
+        if (entry == impl_->contract_ids.end()) {
+            contracts_by_position.push_back(std::nullopt);
+        } else {
+            contracts_by_position.push_back(entry->second);
+            ++known_contract_count;
+        }
     }
 
     for (const auto& factor : factors) {
@@ -890,17 +917,65 @@ QueryResult FactorStore::query(const std::vector<std::string>& factors,
 
     // Lock the whole read set before visiting any block.
     const auto locks = impl_->lock_factors<std::shared_lock<std::shared_mutex>>(std::move(ids));
+    const auto requested_blocks = known_contract_count * (single_day ? 1 : by_year.size());
+    const auto scan_block_limit = requested_blocks / scan_probe_ratio;
+    std::optional<QueryContractPositions> scan_positions;
+    if (known_contract_count >= min_scan_contracts) {
+        std::size_t estimated_savings = 0;
+        for (const auto* factor : factors_by_position) {
+            if (factor && factor->blocks.size() <= scan_block_limit) {
+                estimated_savings += requested_blocks - factor->blocks.size();
+            }
+        }
+        // Build the shared index only when enough lookups can be avoided to pay for it.
+        if (estimated_savings / contracts.size() >= min_scan_savings_per_contract) {
+            scan_positions.emplace(contracts_by_position, known_contract_count);
+        }
+    }
+
     for (std::size_t f = 0; f < factors.size(); ++f) {
         if (!factors_by_position[f]) {
             continue;
         }
         const auto& blocks = factors_by_position[f]->blocks;
+        const auto factor_offset = f * contracts.size() * dates.size();
+        if (scan_positions && blocks.size() <= scan_block_limit) {
+            for (const auto& [key, block] : blocks) {
+                const auto year = static_cast<int>(static_cast<std::uint32_t>(key));
+                QueryDays* requested = nullptr;
+                if (single_day) {
+                    if (year != single_day->year) {
+                        continue;
+                    }
+                } else {
+                    const auto entry = by_year.find(year);
+                    if (entry == by_year.end()) {
+                        continue;
+                    }
+                    requested = &entry->second;
+                }
+                const auto entry = scan_positions->first.find(static_cast<ContractId>(key >> 32));
+                if (entry == scan_positions->first.end()) {
+                    continue;
+                }
+                for (auto c = entry->second; c != contracts.size(); c = scan_positions->next[c]) {
+                    const auto offset = factor_offset + c * dates.size();
+                    if (requested) {
+                        block.read_many(*requested, offset, result);
+                    } else {
+                        block.read_one(single_day->day, offset, result);
+                    }
+                }
+            }
+            continue;
+        }
+
         for (std::size_t c = 0; c < contracts.size(); ++c) {
             const auto contract_id = contracts_by_position[c];
             if (!contract_id) {
                 continue;
             }
-            const auto offset = (f * contracts.size() + c) * dates.size();
+            const auto offset = factor_offset + c * dates.size();
             if (single_day) {
                 const auto block = blocks.find(block_key(*contract_id, single_day->year));
                 if (block != blocks.end()) {

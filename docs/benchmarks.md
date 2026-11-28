@@ -17,7 +17,7 @@ taskset -c 3 ./build-bench/benchmarks/factor_store_benchmarks \
 
 ## 负载与测量口径
 
-- `small` 有 8 个因子和 64 个合约，`large` 有 24 个因子和 256 个合约。年度写入使用单因子、单合约，历史查询使用单因子和全部合约。
+- 常规场景中，`small` 有 8 个因子和 64 个合约，`large` 有 24 个因子和 256 个合约。年度写入使用单因子、单合约，历史查询使用单因子和全部合约。覆盖率场景使用更宽的合约轴，规模见对应章节。
 - 数据用固定种子 `20261127` 生成。2024 年和 2025 年各取前 252 个工作日作为模拟日期。年度乱序回补写入 63 日，另有 189 日已存在。单日追加与覆盖以 64 日为初始密度。阈值场景从 191 日写到 192 日。
 - 首次日写包括名称映射、索引建块和分配。稀疏布局在 64 日时还有数组空位，此时的追加测量反映已有块的写入成本。
 - 历史查询跨两年并命中 504 个日期。单日查询读取整张矩阵。无序查询按同样的方式请求两年共 64 日，命中和缺失日期分布在年内。两个高密度无序场景分别设定 25% 和 50% 的缺失率。
@@ -383,3 +383,59 @@ done
 ```
 
 验证覆盖同一批请求中的连续段与重复点查、跨年份和跨位图字边界的缺失值，以及并发写入与稀疏转稠密期间的连续读取。
+
+## 低覆盖率的年度块查找
+
+基准先登记全部请求合约，再按固定种子选择约 5%、25% 或 100% 的合约为每个目标因子写入数据。未覆盖的合约在目标因子中缺少整个年度块。CSV 缺失率按整数截断。覆盖率场景使用 8 因子 × 256 合约的 `small` 规模和 16 因子 × 2,048 合约的 `large` 规模。
+
+- `query-coverage-*-day` 查询一年内一个日期，每个命中块有一个值。
+- `query-coverage-*-month` 查询同一年内 32 日，每个命中块有 32 个值。
+- `query-coverage-*-history` 保存 2012 至 2024 年共 13 年的块，查询 2023 和 2024 年各 16 日。其他年份只写入一天，用于测量历史块数量对查询路径选择的影响。
+
+以 `5d083e2` 为基线，用同一份基准代码比较已有块数不超过预计查找数二分之一、四分之一和八分之一时启用扫描的版本。三轮试跑中，八分之一在 25% 覆盖率时回到直接查找，二分之一会扫描 5% 覆盖的深历史场景。最终采用四分之一。初版在全部候选因子预计省下的查找达到合约轴长度的四倍时建索引，256 合约、25% 覆盖率的单年查询 P50 上升约 20%。最终门槛提高到七倍，这类查询继续使用直接查找。
+
+最终版本和基线在 WSL2、AMD Ryzen 9 7940H 与 GCC 13.3.0 上运行，编译选项为 `-O3 -DNDEBUG`，固定在逻辑 CPU 4。每种规模和负载交替前后版本顺序运行七轮，每轮采集 61 次。下表为各轮 P50 和 P95 的中位数，单位为 µs。
+
+| 规模 | 场景 | 基线 P50 / P95 | 自适应 P50 / P95 |
+| --- | --- | ---: | ---: |
+| small | `query-coverage-5-day` | 11.31 / 16.03 | 10.83 / 12.13 |
+| small | `query-coverage-25-day` | 10.81 / 13.11 | 10.44 / 13.36 |
+| small | `query-coverage-100-day` | 13.48 / 16.40 | 13.22 / 15.76 |
+| small | `query-coverage-5-month` | 21.55 / 29.32 | 20.31 / 33.54 |
+| small | `query-coverage-25-month` | 45.50 / 68.84 | 43.43 / 69.30 |
+| small | `query-coverage-100-month` | 171.91 / 223.90 | 176.59 / 246.67 |
+| small | `query-coverage-5-history` | 34.96 / 47.89 | 35.23 / 49.98 |
+| small | `query-coverage-25-history` | 121.22 / 158.49 | 114.09 / 155.55 |
+| small | `query-coverage-100-history` | 413.32 / 542.62 | 412.43 / 596.93 |
+| large | `query-coverage-5-day` | 166.09 / 212.02 | 81.85 / 118.60 |
+| large | `query-coverage-25-day` | 227.92 / 289.43 | 152.36 / 201.64 |
+| large | `query-coverage-100-day` | 327.30 / 554.41 | 327.50 / 521.86 |
+| large | `query-coverage-5-month` | 580.46 / 764.61 | 455.33 / 583.74 |
+| large | `query-coverage-25-month` | 2349.91 / 2849.24 | 1808.99 / 2476.41 |
+| large | `query-coverage-100-month` | 10653.74 / 11280.58 | 10622.17 / 11486.83 |
+| large | `query-coverage-5-history` | 1342.59 / 2051.78 | 1400.09 / 2124.57 |
+| large | `query-coverage-25-history` | 7662.25 / 8179.50 | 7767.98 / 8294.44 |
+| large | `query-coverage-100-history` | 27596.96 / 30668.39 | 27761.76 / 30597.72 |
+
+大规模 5% 和 25% 覆盖率的单日 P50 分别下降约 51% 和 33%，32 日 P50 分别下降约 22% 和 23%。小规模 25% 覆盖率的单年查询回到直接查找后，两种请求长度的 P50 均接近基线。满覆盖的 P50 变化在 3% 以内，其中两个小规模场景的 P95 上升约 10%。大规模 5% 覆盖率的深历史查询使用直接查找，P50 上升约 4%。
+
+从仓库根目录构建并复跑。将 `large` 替换为 `small` 可测小规模。
+
+```bash
+scratch=$(mktemp -d)
+git show 5d083e2:src/factor_store.cpp > "$scratch/baseline.cpp"
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
+  benchmarks/factor_store_benchmark.cpp "$scratch/baseline.cpp" -o "$scratch/baseline"
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
+  benchmarks/factor_store_benchmark.cpp src/factor_store.cpp -o "$scratch/adaptive"
+for shape in day month history; do
+  for coverage in 5 25 100; do
+    for version in baseline adaptive; do
+      taskset -c 4 "$scratch/$version" --case "query-coverage-$coverage-$shape" \
+        --profile large --samples 61
+    done
+  done
+done
+```
+
+Release CTest 四项通过，并发用例连续运行 20 次。单元和并发测试通过 ASan、UBSan，并发测试通过 TSan。验证覆盖同一批查询同时使用两条查找路径、重复轴、未登记和缺失数据，以及扫描期间与批量写入交错。

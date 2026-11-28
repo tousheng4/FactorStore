@@ -41,7 +41,9 @@ bool is_concurrent_case(std::string_view name) {
            name == concurrent_dense_case || name == concurrent_day_case;
 }
 
-enum class Shape { annual, daily, history_query, day_query, mixed_query, promotion_query, dense_runs };
+enum class Shape {
+    annual, daily, history_query, day_query, mixed_query, promotion_query, dense_runs, coverage_query
+};
 
 struct Scenario {
     std::string_view name;
@@ -49,9 +51,11 @@ struct Scenario {
     std::size_t stored_days;
     std::size_t missing_dates_per_year = 0;
     bool drain_promotions = false;
+    std::size_t coverage_percent = 100;
+    bool deep_history = false;
 };
 
-constexpr std::array<Scenario, 18> scenarios{{
+constexpr std::array<Scenario, 27> scenarios{{
     {"year-new", Shape::annual, 0},
     {"year-overwrite", Shape::annual, days_per_year},
     {"year-backfill", Shape::annual, 189},
@@ -70,6 +74,15 @@ constexpr std::array<Scenario, 18> scenarios{{
     {"query-dense-calendar", Shape::dense_runs, 224},
     {"query-dense-weekdays", Shape::dense_runs, 224},
     {"query-dense-shuffled", Shape::dense_runs, 224},
+    {"query-coverage-5-day", Shape::coverage_query, 1, 0, false, 5},
+    {"query-coverage-25-day", Shape::coverage_query, 1, 0, false, 25},
+    {"query-coverage-100-day", Shape::coverage_query, 1},
+    {"query-coverage-5-month", Shape::coverage_query, 32, 0, false, 5},
+    {"query-coverage-25-month", Shape::coverage_query, 32, 0, false, 25},
+    {"query-coverage-100-month", Shape::coverage_query, 32},
+    {"query-coverage-5-history", Shape::coverage_query, 32, 0, false, 5, true},
+    {"query-coverage-25-history", Shape::coverage_query, 32, 0, false, 25, true},
+    {"query-coverage-100-history", Shape::coverage_query, 32, 0, false, 100, true},
 }};
 
 struct Options {
@@ -393,6 +406,86 @@ Measurement query(const Scenario& scenario, const Options& options,
     return {std::move(elapsed), cells, std::to_string(100 * missing / requested.size())};
 }
 
+Measurement coverage_query(const Scenario& scenario, const Options& options) {
+    const bool large = options.profile == "large";
+    const auto factors = names("factor_", large ? 16 : 8);
+    const auto contracts = names("contract_", large ? 2048 : 256);
+    const auto covered_count = contracts.size() * scenario.coverage_percent / 100;
+    std::vector<std::size_t> contract_positions(contracts.size());
+    std::iota(contract_positions.begin(), contract_positions.end(), std::size_t{0});
+    permute(contract_positions);
+
+    std::vector<std::string> covered;
+    std::vector<bool> present(contracts.size());
+    for (std::size_t i = 0; i < covered_count; ++i) {
+        const auto position = contract_positions[i];
+        covered.push_back(contracts[position]);
+        present[position] = true;
+    }
+
+    const auto calendar = year_days(2024, 0);
+    FactorStore store;
+    store.upsert_day(calendar.front(), {"registry"}, contracts,
+                     std::vector<double>(contracts.size(), 0.0));
+    std::vector<double> values(factors.size() * covered_count);
+    const auto value_at = [&](std::size_t f, std::size_t c, TradingDate date) {
+        return static_cast<double>(f * contracts.size() + c) + date_offset(date);
+    };
+    const auto load = [&](TradingDate date) {
+        for (std::size_t f = 0; f < factors.size(); ++f) {
+            for (std::size_t c = 0; c < covered_count; ++c) {
+                values[f * covered_count + c] = value_at(f, contract_positions[c], date);
+            }
+        }
+        store.upsert_day(date, factors, covered, values);
+    };
+
+    std::vector<TradingDate> dates(calendar.begin(), calendar.begin() + scenario.stored_days);
+    for (const auto date : dates) {
+        load(date);
+    }
+    if (scenario.deep_history) {
+        for (int year = 2012; year <= 2022; ++year) {
+            load(year * 10000 + 102);
+        }
+        for (std::size_t i = 0; i < dates.size() / 2; ++i) {
+            dates[i] -= 10000;
+            load(dates[i]);
+        }
+    }
+
+    const auto cells = factors.size() * contracts.size() * dates.size();
+    auto elapsed = measure(options.samples, [&](bool warmup) {
+        const auto begin = Clock::now();
+        const auto result = store.query(factors, contracts, dates);
+        const auto us = microseconds_since(begin);
+        verify(result.values.size() == cells && result.factor_count == factors.size() &&
+               result.contract_count == contracts.size() && result.date_count == dates.size());
+        const auto check_series = [&](std::size_t f, std::size_t c) {
+            const auto offset = (f * contracts.size() + c) * dates.size();
+            for (std::size_t d = 0; d < dates.size(); ++d) {
+                verify(result.has_value(offset + d) == present[c]);
+                if (present[c]) {
+                    verify(result.values[offset + d] == value_at(f, c, dates[d]));
+                }
+            }
+        };
+        if (warmup) {
+            for (std::size_t f = 0; f < factors.size(); ++f) {
+                for (std::size_t c = 0; c < contracts.size(); ++c) {
+                    check_series(f, c);
+                }
+            }
+        } else {
+            check_series(0, contract_positions.back());
+            check_series(factors.size() - 1, contract_positions.front());
+        }
+        return us;
+    });
+    const auto missing_percent = 100 * (contracts.size() - covered_count) / contracts.size();
+    return {std::move(elapsed), cells, std::to_string(missing_percent)};
+}
+
 std::string peak_rss_kib(bool isolated) {
 #ifdef __linux__
     struct rusage usage {};
@@ -510,6 +603,9 @@ void run(const Options& options) {
         } else if (scenario.shape == Shape::daily) {
             print_measurement(scenario.name, scenario.stored_days, options,
                               daily(scenario, options, factors, contracts));
+        } else if (scenario.shape == Shape::coverage_query) {
+            print_measurement(scenario.name, scenario.stored_days, options,
+                              coverage_query(scenario, options));
         } else {
             print_measurement(scenario.name, scenario.stored_days, options,
                               query(scenario, options, factors, contracts));

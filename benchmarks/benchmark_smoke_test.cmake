@@ -27,6 +27,15 @@ set(expected_rows
     "query-dense-calendar,small,3,65536,224,12"
     "query-dense-weekdays,small,3,65536,224,12"
     "query-dense-shuffled,small,3,65536,224,12"
+    "query-coverage-5-day,small,3,2048,1,95"
+    "query-coverage-25-day,small,3,2048,1,75"
+    "query-coverage-100-day,small,3,2048,1,0"
+    "query-coverage-5-month,small,3,65536,32,95"
+    "query-coverage-25-month,small,3,65536,32,75"
+    "query-coverage-100-month,small,3,65536,32,0"
+    "query-coverage-5-history,small,3,65536,32,95"
+    "query-coverage-25-history,small,3,65536,32,75"
+    "query-coverage-100-history,small,3,65536,32,0"
 )
 string(REPLACE "\r" "" output "${output}")
 foreach(row IN LISTS expected_rows)

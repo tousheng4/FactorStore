@@ -253,6 +253,47 @@ void test_query_bitmap_sharing_and_single_dates() {
     compare_query(store, expected, factors, contracts, runs);
 }
 
+void test_query_with_mixed_block_coverage() {
+    FactorStore store;
+    std::vector<std::string> contracts;
+    for (int i = 0; i < 96; ++i) {
+        contracts.push_back("contract_" + std::to_string(i));
+    }
+
+    constexpr TradingDate recent = 20240229;
+    constexpr TradingDate earlier = 20230102;
+    const std::vector<std::string> covered{contracts.front(), contracts[1], "outside"};
+    const auto nan = std::numeric_limits<double>::quiet_NaN();
+    std::vector<std::string> factors;
+    Model expected;
+    for (int i = 0; i < 8; ++i) {
+        const auto factor = "sparse_" + std::to_string(i);
+        const auto value = static_cast<double>(i);
+        store.upsert_day(recent, {factor}, covered, {value, nan, 100.0});
+        store.upsert_year(factor, covered.front(), 2023, {{earlier, -value}});
+        store.upsert_year(factor, covered.front(), 2022, {{20220102, 20.0}});
+        expected[{factor, covered.front(), recent}] = value;
+        expected[{factor, covered[1], recent}] = nan;
+        expected[{factor, covered.front(), earlier}] = -value;
+        factors.push_back(factor);
+    }
+
+    store.upsert_day(recent, {"wide"}, contracts, std::vector<double>(contracts.size(), 5.0));
+    for (const auto& contract : contracts) {
+        expected[{"wide", contract, recent}] = 5.0;
+    }
+    factors.insert(factors.begin(), "wide");
+    factors.push_back("absent");
+    factors.push_back("sparse_0");
+    std::reverse(contracts.begin(), contracts.end());
+    contracts.push_back(covered.front());
+    contracts.push_back("absent");
+    contracts.push_back(covered[1]);
+    compare_query(store, expected, factors, contracts, {recent});
+    compare_query(store, expected, factors, contracts,
+                  {recent, earlier, recent, 20240101, 20200301, earlier});
+}
+
 void test_pending_promotions_survive_writes_and_factor_deletion() {
     FactorStore store;
     const auto dates = leap_year_dates();
@@ -384,6 +425,7 @@ int main() {
         test_single_value_block_expands_in_date_order();
         test_full_leap_year();
         test_query_bitmap_sharing_and_single_dates();
+        test_query_with_mixed_block_coverage();
         test_pending_promotions_survive_writes_and_factor_deletion();
         test_delete_and_name_ownership();
         test_randomized_reference_model();

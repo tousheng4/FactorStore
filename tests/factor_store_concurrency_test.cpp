@@ -55,12 +55,24 @@ void run_with_two_readers(Read read, Write write) {
     }
 }
 
-void test_query_observes_one_complete_batch() {
+void test_query_observes_one_complete_batch(bool low_coverage) {
     FactorStore store;
-    const std::vector<std::string> factors{"first", "second", "third"};
-    const std::vector<std::string> read_factors{"third", "second", "first", "third"};
+    const std::vector<std::string> factors{
+        "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth"};
     const std::vector<std::string> write_factors(factors.rbegin(), factors.rend());
+    auto read_factors = write_factors;
+    read_factors.push_back(factors.back());
     const auto codes = contracts();
+    auto read_codes = codes;
+    if (low_coverage) {
+        std::vector<std::string> extra;
+        for (int i = 0; i < 224; ++i) {
+            extra.push_back("unused_" + std::to_string(i));
+        }
+        store.upsert_day(date, {"register"}, extra, std::vector<double>(extra.size(), 0.0));
+        check(store.erase_factor("register"), "missing registration factor");
+        read_codes.insert(read_codes.end(), extra.begin(), extra.end());
+    }
     const std::vector<TradingDate> dates{date};
     const auto cells = factors.size() * codes.size();
     std::vector<double> updates(cells, 0.0);
@@ -69,13 +81,15 @@ void test_query_observes_one_complete_batch() {
     run_with_two_readers(
         [&] {
             for (int i = 0; i < iterations; ++i) {
-                const auto result = store.query(read_factors, codes, dates);
-                const auto read_cells = read_factors.size() * codes.size();
+                const auto result = store.query(read_factors, read_codes, dates);
+                const auto read_cells = read_factors.size() * read_codes.size();
                 check(result.values.size() == read_cells, "wrong query size");
                 const auto value = result.values.front();
                 for (std::size_t j = 0; j < read_cells; ++j) {
-                    check(result.has_value(j) && result.values[j] == value,
-                          "query observed a partially applied batch");
+                    const bool present = j % read_codes.size() < codes.size();
+                    check(result.has_value(j) == present &&
+                              (!present || result.values[j] == value),
+                          "query observed a partially applied batch or incorrect coverage");
                 }
                 check(store.factor_count() == factors.size(), "factor count changed");
             }
@@ -214,7 +228,8 @@ void test_promotion_during_writes_to_other_factors() {
 
 int main() {
     try {
-        test_query_observes_one_complete_batch();
+        test_query_observes_one_complete_batch(false);
+        test_query_observes_one_complete_batch(true);
         test_query_during_delete_and_recreate();
         test_annual_and_daily_writers_share_a_block();
         test_promotion_during_writes_to_other_factors();
