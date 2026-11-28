@@ -10,12 +10,16 @@ project(
 option(FACTOR_STORE_BUILD_TESTS "Build FactorStore unit tests" ON)
 option(FACTOR_STORE_BUILD_BENCHMARKS "Build FactorStore benchmarks" OFF)
 
+set(THREADS_PREFER_PTHREAD_FLAG TRUE)
+find_package(Threads REQUIRED)
+
 add_library(factor_store
     src/factor_store.cpp
 )
 add_library(FactorStore::factor_store ALIAS factor_store)
 
 target_compile_features(factor_store PUBLIC cxx_std_17)
+target_link_libraries(factor_store PUBLIC Threads::Threads)
 target_include_directories(
     factor_store
     PUBLIC

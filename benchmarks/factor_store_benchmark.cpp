@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <locale>
@@ -12,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -28,6 +31,7 @@ using Clock = std::chrono::steady_clock;
 
 constexpr unsigned seed = 20261127;
 constexpr std::size_t days_per_year = 252;
+constexpr std::string_view concurrent_case = "concurrent-mixed";
 
 enum class Shape { annual, daily, history_query, day_query, mixed_query, promotion_query };
 
@@ -74,7 +78,7 @@ Options parse_options(int argc, char** argv) {
         if (argument == "--case") {
             const auto known = std::any_of(scenarios.begin(), scenarios.end(),
                                            [&](const Scenario& s) { return s.name == value; });
-            if (!known && value != "all") {
+            if (!known && value != "all" && value != concurrent_case) {
                 throw std::invalid_argument("unknown case: " + std::string(value));
             }
             options.selected_case = value;
@@ -369,7 +373,8 @@ std::string peak_rss_kib(bool isolated) {
     return "NA";
 }
 
-void print_measurement(const Scenario& scenario, const Options& options, const Measurement& result) {
+void print_measurement(std::string_view name, std::size_t stored_days, const Options& options,
+                       const Measurement& result) {
     const auto& times = result.elapsed_us;
     const auto percentile = [&](std::size_t percent) {
         return times[(percent * times.size() + 99) / 100 - 1];
@@ -379,11 +384,70 @@ void print_measurement(const Scenario& scenario, const Options& options, const M
         throw std::runtime_error("timer resolution is too coarse");
     }
 
-    std::cout << scenario.name << ',' << options.profile << ',' << times.size() << ','
-              << result.cells << ',' << scenario.stored_days << ',' << result.missing_percent << ','
+    std::cout << name << ',' << options.profile << ',' << times.size() << ','
+              << result.cells << ',' << stored_days << ',' << result.missing_percent << ','
               << std::fixed << std::setprecision(3) << percentile(50) << ',' << percentile(95) << ','
               << std::setprecision(0) << 1000000.0 * result.cells * times.size() / total_us << ','
               << peak_rss_kib(options.selected_case != "all") << '\n';
+}
+
+void concurrent(const Options& options, const std::vector<std::string>& factors,
+                const std::vector<std::string>& contracts) {
+    constexpr std::size_t stored_days = 64;
+    constexpr std::size_t requested_days = 32;
+    const auto dates = weekdays(2024, 0);
+    const std::vector<TradingDate> requested(dates.begin(), dates.begin() + requested_days);
+    const auto values = generate_values(factors.size() * contracts.size());
+    const auto read_cells = values.size() * requested.size();
+    FactorStore store;
+    for (std::size_t i = 0; i < stored_days; ++i) {
+        store.upsert_day(dates[i], factors, contracts, values);
+    }
+
+    const auto read = [&](bool) {
+        const auto begin = Clock::now();
+        const auto result = store.query(factors, contracts, requested);
+        const auto elapsed = microseconds_since(begin);
+        verify(result.values.size() == read_cells && result.has_value(0) &&
+               result.has_value(read_cells - 1) && result.values.front() == values.front() &&
+               result.values.back() == values.back());
+        return elapsed;
+    };
+    const auto write = [&](bool) {
+        const auto begin = Clock::now();
+        store.upsert_day(dates.front(), factors, contracts, values);
+        return microseconds_since(begin);
+    };
+    print_measurement("concurrent-read-alone", stored_days, options,
+                      {measure(options.samples, read), read_cells, "0"});
+    print_measurement("concurrent-write-alone", stored_days, options,
+                      {measure(options.samples, write), values.size(), "-"});
+
+    std::atomic<std::size_t> ready{0};
+    std::array<std::future<std::vector<double>>, 2> readers;
+    std::promise<void> start;
+    const auto gate = start.get_future().share();
+    for (auto& reader : readers) {
+        reader = std::async(std::launch::async, [&, gate] {
+            ++ready;
+            gate.get();
+            return measure(options.samples, read);
+        });
+    }
+    while (ready.load() != readers.size()) {
+        std::this_thread::yield();
+    }
+    start.set_value();
+    auto writes = measure(options.samples, write);
+
+    auto reads = readers.front().get();
+    const auto other_reads = readers.back().get();
+    reads.insert(reads.end(), other_reads.begin(), other_reads.end());
+    std::sort(reads.begin(), reads.end());
+    print_measurement("concurrent-read-mixed", stored_days, options,
+                      {std::move(reads), read_cells, "0"});
+    print_measurement("concurrent-write-mixed", stored_days, options,
+                      {std::move(writes), values.size(), "-"});
 }
 
 void run(const Options& options) {
@@ -393,16 +457,22 @@ void run(const Options& options) {
     std::cout.imbue(std::locale::classic());
     std::cout << "case,profile,samples,cells_per_batch,stored_days_per_block,missing_percent,"
                  "p50_us,p95_us,cells_per_second,peak_rss_kib\n";
+    if (options.selected_case == concurrent_case) {
+        concurrent(options, factors, contracts);
+        return;
+    }
     for (const auto& scenario : scenarios) {
         if (options.selected_case != "all" && options.selected_case != scenario.name) {
             continue;
         }
         if (scenario.shape == Shape::annual) {
-            print_measurement(scenario, options, annual(scenario, options));
+            print_measurement(scenario.name, scenario.stored_days, options, annual(scenario, options));
         } else if (scenario.shape == Shape::daily) {
-            print_measurement(scenario, options, daily(scenario, options, factors, contracts));
+            print_measurement(scenario.name, scenario.stored_days, options,
+                              daily(scenario, options, factors, contracts));
         } else {
-            print_measurement(scenario, options, query(scenario, options, factors, contracts));
+            print_measurement(scenario.name, scenario.stored_days, options,
+                              query(scenario, options, factors, contracts));
         }
     }
 }
@@ -416,7 +486,7 @@ int main(int argc, char** argv) {
         for (const auto& scenario : scenarios) {
             std::cout << ", " << scenario.name;
         }
-        std::cout << '\n';
+        std::cout << ", " << concurrent_case << " (run separately)\n";
         return 0;
     }
     try {

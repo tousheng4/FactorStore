@@ -5,8 +5,10 @@
 #include <bitset>
 #include <deque>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <optional>
+#include <shared_mutex>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -426,6 +428,8 @@ struct Factor {
 }  // namespace
 
 struct FactorStore::Impl {
+    mutable std::shared_mutex mutex;
+
     // Destroy the factors and their links before destroying the queue sentinel.
     PromotionQueue promotions;
     // The owner containers keep strings stable even when the index tables rehash.
@@ -506,6 +510,7 @@ void FactorStore::upsert_year(std::string_view factor,
         return a.day < b.day;
     });
 
+    const std::unique_lock lock(impl_->mutex);
     const auto key = block_key(impl_->get_or_add_contract(contract), year);
     impl_->write_factor(factor, [&](Factor& target) {
         target.write_block(key, [&](YearBlock& block) { block.merge(indexed); });
@@ -529,6 +534,7 @@ void FactorStore::upsert_day(TradingDate date,
 
     std::vector<BlockKey> keys;
     keys.reserve(contracts.size());
+    const std::unique_lock lock(impl_->mutex);
     for (const auto& contract : contracts) {
         keys.push_back(block_key(impl_->get_or_add_contract(contract), indexed.year));
     }
@@ -550,11 +556,13 @@ void FactorStore::upsert_day(TradingDate date,
 }
 
 std::size_t FactorStore::factor_count() const {
+    const std::shared_lock lock(impl_->mutex);
     return impl_->factors.size();
 }
 
 bool FactorStore::erase_factor(std::string_view factor) {
     validate_name(factor);
+    const std::unique_lock lock(impl_->mutex);
     const auto entry = impl_->factor_ids.find(factor);
     if (entry == impl_->factor_ids.end()) {
         return false;
@@ -605,6 +613,11 @@ QueryResult FactorStore::query(const std::vector<std::string>& factors,
 
     std::vector<std::optional<ContractId>> contracts_by_position;
     contracts_by_position.reserve(contracts.size());
+    result.values.resize(cell_count);
+    result.validity.resize(word_count);
+
+    // Hold a shared lock from resolving names through filling the last result cell.
+    const std::shared_lock lock(impl_->mutex);
     for (const auto& contract : contracts) {
         const auto entry = impl_->contract_ids.find(contract);
         contracts_by_position.push_back(entry == impl_->contract_ids.end()
@@ -612,8 +625,6 @@ QueryResult FactorStore::query(const std::vector<std::string>& factors,
                                             : std::optional<ContractId>(entry->second));
     }
 
-    result.values.resize(cell_count);
-    result.validity.resize(word_count);
     for (std::size_t f = 0; f < factors.size(); ++f) {
         const auto entry = impl_->factor_ids.find(factors[f]);
         if (entry == impl_->factor_ids.end()) {

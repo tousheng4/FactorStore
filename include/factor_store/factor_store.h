@@ -37,6 +37,7 @@ struct QueryResult {
     }
 };
 
+// Operations on a live instance are synchronized. Callers keep inputs and the instance alive.
 class FactorStore final {
 public:
     FactorStore();

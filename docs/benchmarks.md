@@ -13,7 +13,7 @@ taskset -c 3 ./build-bench/benchmarks/factor_store_benchmarks \
   --case query-mixed-dense --profile large --samples 61
 ```
 
-`--help` 列出全部场景，`--case` 默认执行全部，`--profile` 默认为 `small`，`--samples` 默认为 31。需要逐场景的峰值内存时，为每个场景启动一次新的进程。CPU 编号按本机可用范围选择。
+`--help` 列出全部场景。`--case` 默认执行全部单线程场景，读写混合场景单独用 `--case concurrent-mixed` 启动。`--profile` 默认为 `small`，`--samples` 默认为 31。需要逐场景的峰值内存时，为每个场景启动一次新的进程。CPU 编号按本机可用范围选择。
 
 ## 负载与测量口径
 
@@ -91,11 +91,11 @@ git show c551385:src/factor_store.cpp > "$scratch/sparse.cpp"
 git show 2ec688c:src/factor_store.cpp > "$scratch/hybrid.cpp"
 sed 's/dense_threshold = 192;/dense_threshold = 1;/' "$scratch/hybrid.cpp" \
   > "$scratch/dense.cpp"
-g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
   "$scratch/sparse.cpp" -o "$scratch/sparse"
-g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
   "$scratch/dense.cpp" -o "$scratch/dense"
-g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
   "$scratch/hybrid.cpp" -o "$scratch/hybrid"
 
 for order in 'sparse hybrid dense' 'hybrid dense sparse' 'dense sparse hybrid'; do
@@ -135,9 +135,9 @@ done
 ```bash
 scratch=$(mktemp -d)
 git show 2ec688c:src/factor_store.cpp > "$scratch/baseline.cpp"
-g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
   "$scratch/baseline.cpp" -o "$scratch/baseline"
-g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
   src/factor_store.cpp -o "$scratch/optimized"
 for order in 'baseline optimized' 'optimized baseline' 'baseline optimized'; do
   for version in $order; do
@@ -220,9 +220,9 @@ done
 ```bash
 scratch=$(mktemp -d)
 git show bd756ec:src/factor_store.cpp > "$scratch/baseline.cpp"
-g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
   "$scratch/baseline.cpp" -o "$scratch/baseline"
-g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
   src/factor_store.cpp -o "$scratch/optimized"
 for order in 'baseline optimized' 'optimized baseline' 'baseline optimized'; do
   for version in $order; do
@@ -230,3 +230,27 @@ for order in 'baseline optimized' 'optimized baseline' 'baseline optimized'; do
   done
 done
 ```
+
+## 读写混合负载
+
+使用同一实例和同一组数据，分别测单独执行与混合执行。每个年度块预写 64 日，查询读取其中 32 日，日写覆盖已有的一天。混合场景由两个读取线程和一个写入线程同时启动。每个线程先预热一次，再分别采集 101 次调用。计时包含 API 内的准备、锁等待和访问数据。
+
+在 WSL2 使用 GCC 13.3.0 和 Release 构建，将进程固定在逻辑 CPU 2、3、4。每个规模运行三轮，下表取各轮 P50 和 P95 的中位数。延迟单位为 µs。
+
+| 规模 | 操作 | 每批值数 | 单独 P50 / P95 | 混合 P50 / P95 |
+| --- | --- | ---: | ---: | ---: |
+| small | 查询 | 16384 | 35.03 / 52.26 | 35.27 / 120.73 |
+| small | 日写 | 512 | 7.76 / 8.94 | 7.91 / 172.80 |
+| large | 查询 | 196608 | 765.94 / 1683.88 | 1063.97 / 1930.28 |
+| large | 日写 | 6144 | 111.84 / 228.34 | 1053.88 / 2117.13 |
+
+实例级锁给一次查询提供完整的状态视图。在该大型负载中，查询 P95 从约 1.68 ms 增至 1.93 ms，日写 P95 从约 0.23 ms 增至 2.12 ms。锁竞争的代价主要体现在写入尾延迟。实际等待随查询长度、读写比例和线程调度变化。
+
+用本文开头的命令构建后即可复测。混合场景使用多个逻辑 CPU。
+
+```bash
+taskset -c 2,3,4 ./build-bench/benchmarks/factor_store_benchmarks \
+  --case concurrent-mixed --profile large --samples 101
+```
+
+Release CTest 四项通过，并发用例连续运行 20 次。并发用例也通过 ASan、UBSan 和 TSan。本次在 WSL 上用 `setarch x86_64 -R` 仅对 TSan 测试进程关闭地址随机化后运行检查。

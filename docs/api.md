@@ -7,8 +7,16 @@
 - 每条数据由因子名称、合约名称和交易日期唯一标识，值为 `double`。名称非空，按字符串内容精确匹配，区分大小写。
 - `TradingDate` 是按 `YYYYMMDD` 编码的整数，例如 `20260227`。支持公历 1 至 9999 年并校验闰日。交易日历由调用方管理，库校验公历日期。
 - `0.0` 和 `NaN` 都可写入，且都属于存在的值。查询用有效位图区分存在与缺失。
-- 输入在调用期间借用。调用返回后，调用方可以释放或修改输入。查询结果拥有独立的缓冲区。同一实例的并发访问由调用方同步。
+- 输入在调用期间借用，调用方应保持输入不变。调用返回后，调用方可以释放或修改输入。查询结果拥有独立的缓冲区。
 - 每个 `FactorStore` 实例在构造后为空，独立持有数据，析构时释放数据。实例禁止复制和移动。
+
+## 并发语义
+
+同一实例支持多线程调用。查询和计数可以并行，年度写入、单日写入和删除独占访问。一次查询得到该调用期间的一个一致状态，成功的写入批次对它整体可见。日写触发的稠密块转换也在独占访问期间完成。
+
+删除与同名重建是两个操作。两次操作之间的查询可以看到该因子缺失，重建后的查询读取新写入的数据。每次调用独立同步。如果业务要把多个调用视为一个操作，调用方需要协调它们的时序。析构实例前，调用方应等待对该实例的所有调用完成。
+
+写入发生内存分配错误时，部分更新可能保留，并在该次调用退出后对其他操作可见。
 
 ## 年度批量写入
 
@@ -109,7 +117,7 @@ int main() {
 ```bash
 cmake -S . -B build-example -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
 cmake --build build-example --target factor_store
-g++ -std=c++17 -Iinclude example.cpp build-example/libfactor_store.a -o build-example/example
+g++ -std=c++17 -pthread -Iinclude example.cpp build-example/libfactor_store.a -o build-example/example
 ./build-example/example
 ```
 
