@@ -13,7 +13,7 @@ taskset -c 3 ./build-bench/benchmarks/factor_store_benchmarks \
   --case query-mixed-dense --profile large --samples 61
 ```
 
-`--help` 列出全部场景。`--case` 默认执行全部单线程场景，`concurrent-mixed` 和 `concurrent-disjoint` 分别测量读写因子完全重叠与完全不重叠的场景。`--profile` 默认为 `small`，`--samples` 默认为 31。需要逐场景的峰值内存时，为每个场景启动一次新的进程。CPU 编号按本机可用范围选择。
+`--help` 列出全部场景。`--case` 默认执行全部单线程场景。`concurrent-mixed` 和 `concurrent-disjoint` 分别测量读写因子完全重叠与完全不重叠的 32 日查询。`concurrent-dense` 测量稠密块的 32 日查询，`concurrent-day` 测量单日查询，两者的读写因子完全重叠。`--profile` 默认为 `small`，`--samples` 默认为 31。需要逐场景的峰值内存时，为每个场景启动一次新的进程。CPU 编号按本机可用范围选择。
 
 ## 负载与测量口径
 
@@ -291,3 +291,51 @@ done
 ```
 
 因子级锁版本的 Release CTest 四项通过，并发用例连续运行 20 次。带并发转换用例的测试也通过了 ASan、UBSan 和 TSan。
+
+## 查询位图批写与单日短路径
+
+以 `86dd5e2` 为基线，分别构建只启用位图批写、只启用单日短路径和同时启用两项优化的版本。位图批写用于稠密块的多日查询，单日短路径用于只请求一个日期的查询。各版本共用同一份基准代码，使用 WSL2、AMD Ryzen 9 7940H 和 GCC 13.3.0，编译选项为 `-O3 -DNDEBUG`。
+
+单线程测试固定在逻辑 CPU 4。每个场景运行七轮并轮换版本顺序，每轮测量 61 次。表中为各轮 P50 和 P95 的中位数，单位为 µs。
+
+| 规模 | 场景 | 基线 P50 / P95 | 单项优化 P50 / P95 | 合并版 P50 / P95 |
+| --- | --- | ---: | ---: | ---: |
+| small | `query-day` | 3.56 / 3.63 | 4.05 / 4.14 | 3.25 / 3.74 |
+| small | `query-history` | 44.11 / 50.08 | 40.55 / 50.73 | 40.34 / 58.51 |
+| small | `query-mixed-sparse` | 64.49 / 82.64 | — | 67.50 / 82.13 |
+| small | `query-mixed-dense` | 61.11 / 82.03 | 52.58 / 69.10 | 53.35 / 68.22 |
+| small | `query-mixed-dense-25` | 68.30 / 89.22 | 62.24 / 98.46 | 59.17 / 75.77 |
+| large | `query-day` | 42.84 / 65.94 | 39.12 / 63.90 | 39.62 / 59.36 |
+| large | `query-history` | 176.18 / 227.74 | 161.84 / 211.80 | 165.43 / 249.08 |
+| large | `query-mixed-sparse` | 2474.35 / 2956.09 | — | 2474.77 / 3085.09 |
+| large | `query-mixed-dense` | 3904.24 / 4608.80 | 3704.70 / 4308.76 | 3690.80 / 4197.32 |
+| large | `query-mixed-dense-25` | 4688.29 / 5389.12 | 4101.46 / 4523.13 | 4126.37 / 4771.32 |
+
+单项优化列中，`query-day` 使用单日短路径，其余有数据的场景使用位图批写。大型单日查询 P50 下降约 8%，大型稠密乱序查询 P50 下降约 5% 至 12%。合并版的大型跨年历史查询 P50 下降约 6%，P95 从 228 µs 升到 249 µs。独立单日版在小规模场景的 P50 高于基线，合并版的变化幅度小于 1 µs。
+
+混合负载固定在逻辑 CPU 2、4、6，每轮由两个读取线程和一个写入线程同时启动，各采集 101 次调用。读写因子完全重叠。`concurrent-mixed` 从有 64 日的稀疏块读取 32 日，`concurrent-dense` 从有 224 日的稠密块读取 32 日，`concurrent-day` 从单值块读取 1 日。下表为大规模场景的七轮 P95 中位数，单位为 µs。日写耗时包含数据访问和等待锁的时间。
+
+| 场景 | 查询 P95 基线 → 合并版 | 日写 P95 基线 → 合并版 |
+| --- | ---: | ---: |
+| `concurrent-mixed` | 1675.92 → 1804.66 | 1870.02 → 1796.74 |
+| `concurrent-dense` | 1849.29 → 1719.42 | 1989.21 → 1796.78 |
+| `concurrent-day` | 243.12 → 232.65 | 447.29 → 369.77 |
+
+混合场景的尾延迟跨轮波动较大。例如大规模稠密场景的合并版日写 P95 在 1.52 至 2.61 ms 之间，小规模稠密场景的日写 P95 中位数从 264 µs 变为 269 µs。
+
+从仓库根目录复跑基线与合并版。复测小规模时将 `large` 换为 `small`。
+
+```bash
+scratch=$(mktemp -d)
+git show 86dd5e2:src/factor_store.cpp > "$scratch/baseline.cpp"
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
+  benchmarks/factor_store_benchmark.cpp "$scratch/baseline.cpp" -o "$scratch/baseline"
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
+  benchmarks/factor_store_benchmark.cpp src/factor_store.cpp -o "$scratch/combined"
+for version in baseline combined; do
+  taskset -c 4 "$scratch/$version" --case query-mixed-dense-25 --profile large --samples 61
+  taskset -c 2,4,6 "$scratch/$version" --case concurrent-dense --profile large --samples 101
+done
+```
+
+Release CTest 四项通过，并发用例连续运行 20 次。单元和并发用例通过 ASan 与 UBSan，并发用例通过 TSan。新增查询用例检查跨年份和相邻合约共用位图字、重复日期以及单日查询中的缺失和 NaN。

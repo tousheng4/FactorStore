@@ -206,14 +206,24 @@ public:
         unlink();
     }
 
-    void read_many(QueryDays& requested, std::size_t offset, QueryResult& result) const {
+    void read_one(DayIndex day, std::size_t position, QueryResult& result) const {
         if (const auto* owner = std::get_if<DenseOwner>(&storage_)) {
             const DenseBlock& dense = **owner;
-            for (const auto& request : requested.days) {
-                if (dense.present[request.day]) {
-                    set_query_value(result, offset + request.position, dense.values[request.day]);
-                }
+            if (dense.present[day]) {
+                set_query_value(result, position, dense.values[day]);
             }
+        } else if (const auto* single = std::get_if<IndexedValue>(&storage_)) {
+            if (single->day == day) {
+                set_query_value(result, position, single->value);
+            }
+        } else {
+            read_sparse_day(std::get<SparseBlock>(storage_), day, position, result);
+        }
+    }
+
+    void read_many(QueryDays& requested, std::size_t offset, QueryResult& result) const {
+        if (const auto* owner = std::get_if<DenseOwner>(&storage_)) {
+            read_dense(**owner, requested.days, offset, result);
             return;
         }
         if (const auto* single = std::get_if<IndexedValue>(&storage_)) {
@@ -238,11 +248,7 @@ public:
         }
 
         for (const auto& request : requested.days) {
-            const auto day = std::lower_bound(sparse.days.begin(), sparse.days.end(), request.day);
-            if (day != sparse.days.end() && *day == request.day) {
-                set_query_value(result, offset + request.position,
-                                sparse.values[day - sparse.days.begin()]);
-            }
+            read_sparse_day(sparse, request.day, offset + request.position, result);
         }
     }
 
@@ -331,6 +337,37 @@ public:
 
 private:
     friend class PromotionQueue;
+
+    static void read_dense(const DenseBlock& dense, const std::vector<QueryDay>& requested,
+                           std::size_t offset, QueryResult& result) noexcept {
+        auto word = offset / 64;
+        std::uint64_t mask = 0;
+        for (const auto& request : requested) {
+            if (dense.present[request.day]) {
+                const auto position = offset + request.position;
+                result.values[position] = dense.values[request.day];
+                const auto next_word = position / 64;
+                if (next_word != word) {
+                    result.validity[word] |= mask;
+                    word = next_word;
+                    mask = 0;
+                }
+                mask |= std::uint64_t{1} << (position % 64);
+            }
+        }
+        // Other years and neighboring rows can contribute to the same word.
+        if (mask != 0) {
+            result.validity[word] |= mask;
+        }
+    }
+
+    static void read_sparse_day(const SparseBlock& sparse, DayIndex requested,
+                                std::size_t position, QueryResult& result) {
+        const auto day = std::lower_bound(sparse.days.begin(), sparse.days.end(), requested);
+        if (day != sparse.days.end() && *day == requested) {
+            set_query_value(result, position, sparse.values[day - sparse.days.begin()]);
+        }
+    }
 
     [[nodiscard]] bool ready_for_promotion() const noexcept {
         const auto* sparse = std::get_if<SparseBlock>(&storage_);
@@ -737,10 +774,15 @@ QueryResult FactorStore::query(const std::vector<std::string>& factors,
         throw std::length_error("query result exceeds buffer capacity");
     }
 
+    std::optional<IndexedDate> single_day;
     std::unordered_map<int, QueryDays> by_year;
-    for (std::size_t d = 0; d < dates.size(); ++d) {
-        const auto date = parse_date(dates[d]);
-        by_year[date.year].add(date.day, d);
+    if (dates.size() == 1) {
+        single_day = parse_date(dates.front());
+    } else {
+        for (std::size_t d = 0; d < dates.size(); ++d) {
+            const auto date = parse_date(dates[d]);
+            by_year[date.year].add(date.day, d);
+        }
     }
 
     std::vector<std::optional<ContractId>> contracts_by_position;
@@ -783,6 +825,13 @@ QueryResult FactorStore::query(const std::vector<std::string>& factors,
                 continue;
             }
             const auto offset = (f * contracts.size() + c) * dates.size();
+            if (single_day) {
+                const auto block = blocks.find(block_key(*contract_id, single_day->year));
+                if (block != blocks.end()) {
+                    block->second.read_one(single_day->day, offset, result);
+                }
+                continue;
+            }
             for (auto& [year, days] : by_year) {
                 const auto block = blocks.find(block_key(*contract_id, year));
                 if (block == blocks.end()) {

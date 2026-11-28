@@ -203,6 +203,43 @@ void test_full_leap_year() {
     compare_query(store, expected, {"sparse", "factor", "annual", "merged"}, {"contract"}, dates);
 }
 
+void test_query_bitmap_sharing_and_single_dates() {
+    FactorStore store;
+    const auto dates = leap_year_dates();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    Model expected;
+    for (const int year : {2000, 2004}) {
+        std::vector<DailyValue> points;
+        for (std::size_t i = 0; i < 200; ++i) {
+            const auto date = dates[i] + (year - 2000) * 10000;
+            const double value = i == 59 ? nan : static_cast<double>(i + year - 2000);
+            points.push_back({date, value});
+            expected[{"dense", "IF", date}] = value;
+        }
+        store.upsert_year("dense", "IF", year, points);
+    }
+    store.upsert_year("sparse", "IF", 2000, {{20000103, 1.0}, {20000229, 2.0}});
+    store.upsert_day(20000101, {"single"}, {"IF"}, {3.0});
+    expected[{"sparse", "IF", 20000103}] = 1.0;
+    expected[{"sparse", "IF", 20000229}] = 2.0;
+    expected[{"single", "IF", 20000101}] = 3.0;
+
+    const std::array<TradingDate, 8> samples{
+        20040229, 20000103, 20001231, 20000229, 20040103, 20000101, 20041231, 20000103};
+    const std::vector<std::string> factors{"sparse", "dense", "single", "dense", "absent"};
+    const std::vector<std::string> contracts{"IF", "IF", "absent"};
+    for (const auto count : {32U, 64U, 65U, 130U}) {
+        std::vector<TradingDate> requested;
+        for (std::size_t i = 0; i < count; ++i) {
+            requested.push_back(samples[i % samples.size()]);
+        }
+        compare_query(store, expected, factors, contracts, requested);
+    }
+    for (const auto day : samples) {
+        compare_query(store, expected, factors, contracts, {day});
+    }
+}
+
 void test_pending_promotions_survive_writes_and_factor_deletion() {
     FactorStore store;
     const auto dates = leap_year_dates();
@@ -333,6 +370,7 @@ int main() {
         test_empty_and_invalid_batches();
         test_single_value_block_expands_in_date_order();
         test_full_leap_year();
+        test_query_bitmap_sharing_and_single_dates();
         test_pending_promotions_survive_writes_and_factor_deletion();
         test_delete_and_name_ownership();
         test_randomized_reference_model();

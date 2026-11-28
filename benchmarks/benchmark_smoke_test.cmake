@@ -48,13 +48,21 @@ if(NOT isolated_status EQUAL 0 OR NOT isolated_output MATCHES
     message(FATAL_ERROR "Unexpected isolated benchmark output: ${isolated_output}")
 endif()
 
-set(concurrent_rows
-    "concurrent-read-alone,small,3,16384,64,0"
-    "concurrent-write-alone,small,3,512,64,-"
-    "concurrent-read-mixed,small,6,16384,64,0"
-    "concurrent-write-mixed,small,3,512,64,-"
-)
-foreach(scenario IN ITEMS concurrent-mixed concurrent-disjoint)
+foreach(scenario IN ITEMS concurrent-mixed concurrent-disjoint concurrent-dense concurrent-day)
+    set(read_cells 16384)
+    set(stored_days 64)
+    if(scenario STREQUAL "concurrent-dense")
+        set(stored_days 224)
+    elseif(scenario STREQUAL "concurrent-day")
+        set(read_cells 512)
+        set(stored_days 1)
+    endif()
+    set(concurrent_rows
+        "concurrent-read-alone,small,3,${read_cells},${stored_days},0"
+        "concurrent-write-alone,small,3,512,${stored_days},-"
+        "concurrent-read-mixed,small,6,${read_cells},${stored_days},0"
+        "concurrent-write-mixed,small,3,512,${stored_days},-"
+    )
     execute_process(
         COMMAND "${BENCHMARK}" --case "${scenario}" --profile small --samples 3
         RESULT_VARIABLE concurrent_status

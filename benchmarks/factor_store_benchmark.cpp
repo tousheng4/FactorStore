@@ -33,6 +33,13 @@ constexpr unsigned seed = 20261127;
 constexpr std::size_t days_per_year = 252;
 constexpr std::string_view concurrent_case = "concurrent-mixed";
 constexpr std::string_view disjoint_case = "concurrent-disjoint";
+constexpr std::string_view concurrent_dense_case = "concurrent-dense";
+constexpr std::string_view concurrent_day_case = "concurrent-day";
+
+bool is_concurrent_case(std::string_view name) {
+    return name == concurrent_case || name == disjoint_case ||
+           name == concurrent_dense_case || name == concurrent_day_case;
+}
 
 enum class Shape { annual, daily, history_query, day_query, mixed_query, promotion_query };
 
@@ -79,7 +86,7 @@ Options parse_options(int argc, char** argv) {
         if (argument == "--case") {
             const auto known = std::any_of(scenarios.begin(), scenarios.end(),
                                            [&](const Scenario& s) { return s.name == value; });
-            if (!known && value != "all" && value != concurrent_case && value != disjoint_case) {
+            if (!known && value != "all" && !is_concurrent_case(value)) {
                 throw std::invalid_argument("unknown case: " + std::string(value));
             }
             options.selected_case = value;
@@ -394,8 +401,10 @@ void print_measurement(std::string_view name, std::size_t stored_days, const Opt
 
 void concurrent(const Options& options, const std::vector<std::string>& factors,
                 const std::vector<std::string>& contracts) {
-    constexpr std::size_t stored_days = 64;
-    constexpr std::size_t requested_days = 32;
+    const bool single_day = options.selected_case == concurrent_day_case;
+    const std::size_t stored_days = single_day ? 1 :
+        (options.selected_case == concurrent_dense_case ? 224 : 64);
+    const std::size_t requested_days = single_day ? 1 : 32;
     const auto dates = weekdays(2024, 0);
     const std::vector<TradingDate> requested(dates.begin(), dates.begin() + requested_days);
     const auto writer_factors = options.selected_case == disjoint_case
@@ -464,7 +473,7 @@ void run(const Options& options) {
     std::cout.imbue(std::locale::classic());
     std::cout << "case,profile,samples,cells_per_batch,stored_days_per_block,missing_percent,"
                  "p50_us,p95_us,cells_per_second,peak_rss_kib\n";
-    if (options.selected_case == concurrent_case || options.selected_case == disjoint_case) {
+    if (is_concurrent_case(options.selected_case)) {
         concurrent(options, factors, contracts);
         return;
     }
@@ -493,7 +502,9 @@ int main(int argc, char** argv) {
         for (const auto& scenario : scenarios) {
             std::cout << ", " << scenario.name;
         }
-        std::cout << ", " << concurrent_case << ", " << disjoint_case << " (run separately)\n";
+        std::cout << ", " << concurrent_case << ", " << disjoint_case
+                  << ", " << concurrent_dense_case << ", " << concurrent_day_case
+                  << " (run separately)\n";
         return 0;
     }
     try {
