@@ -130,15 +130,14 @@ done
 
 稀疏无序查询的 P50 降幅最大，两种规模均超过 57%。跨年历史查询同样受益。单日点查的 P50 大致持平，小规模单日点查的 P95 略有增加。高密度、低缺失率场景的耗时波动较大。
 
-下列命令使用同一份基准程序，对比逐日期查询的基线与当前实现。若当前实现已包含分批转换，结果会反映两项优化的组合效果，上表只衡量分块查询优化。命令需在包含基线提交的 Git 工作副本中执行。
+先按本文开头的 CMake 命令构建当前版本。下列命令使用同一份基准源码，对比逐日期查询的基线与当前实现。当前版包含后续优化，上表对应分块查询这一阶段的测量。
 
 ```bash
 scratch=$(mktemp -d)
 git show 2ec688c:src/factor_store.cpp > "$scratch/baseline.cpp"
 g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
   "$scratch/baseline.cpp" -o "$scratch/baseline"
-g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
-  src/factor_store.cpp -o "$scratch/optimized"
+cp build-bench/benchmarks/factor_store_benchmarks "$scratch/optimized"
 for order in 'baseline optimized' 'optimized baseline' 'baseline optimized'; do
   for version in $order; do
     taskset -c 3 "$scratch/$version" --case query-mixed-sparse --profile large --samples 61
@@ -215,15 +214,16 @@ done
 - `day-second` 在同一批块先各写入一天，再测第二天的写入。大型场景的 P50 从约 224 µs 降至 207 µs，第二次写入的分配计数仍为 12,571 次。前两天累计节省 12,288 次分配。
 - 大型单日查询 P50 从约 58.81 µs 降至 40.99 µs。跨年查询 P50 接近，本轮 P95 从约 232 µs 升到 320 µs。大型稠密无序查询和跨阈值日写的 P50 也小幅增加，收益主要集中在单值块。
 
-用开头的 Release 命令构建后，可运行 `day-new`、`day-second` 和 `query-day`。要对比基线，可在包含 `bd756ec` 的 Git 工作副本中，用当前的基准源码分别链接两版实现。
+用开头的 Release 命令构建后，可运行 `day-new`、`day-second` 和 `query-day`。也可以用当前的基准源码对比 `bd756ec` 和引入单值内联的 `72cb5ef`。
 
 ```bash
 scratch=$(mktemp -d)
 git show bd756ec:src/factor_store.cpp > "$scratch/baseline.cpp"
+git show 72cb5ef:src/factor_store.cpp > "$scratch/optimized.cpp"
 g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
   "$scratch/baseline.cpp" -o "$scratch/baseline"
 g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
-  src/factor_store.cpp -o "$scratch/optimized"
+  "$scratch/optimized.cpp" -o "$scratch/optimized"
 for order in 'baseline optimized' 'optimized baseline' 'baseline optimized'; do
   for version in $order; do
     taskset -c 3 "$scratch/$version" --case day-new --profile large --samples 31
@@ -279,10 +279,11 @@ Release CTest 四项通过，并发用例连续运行 20 次。并发用例也�
 ```bash
 scratch=$(mktemp -d)
 git show ce47518:src/factor_store.cpp > "$scratch/baseline.cpp"
+git show 86dd5e2:src/factor_store.cpp > "$scratch/factor-locks.cpp"
 g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
   benchmarks/factor_store_benchmark.cpp "$scratch/baseline.cpp" -o "$scratch/baseline"
 g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
-  benchmarks/factor_store_benchmark.cpp src/factor_store.cpp -o "$scratch/factor-locks"
+  benchmarks/factor_store_benchmark.cpp "$scratch/factor-locks.cpp" -o "$scratch/factor-locks"
 for scenario in concurrent-mixed concurrent-disjoint; do
   for version in baseline factor-locks; do
     taskset -c 2,4,6 "$scratch/$version" --case "$scenario" --profile large --samples 101
@@ -328,10 +329,11 @@ done
 ```bash
 scratch=$(mktemp -d)
 git show 86dd5e2:src/factor_store.cpp > "$scratch/baseline.cpp"
+git show 6384c32:src/factor_store.cpp > "$scratch/combined.cpp"
 g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
   benchmarks/factor_store_benchmark.cpp "$scratch/baseline.cpp" -o "$scratch/baseline"
 g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
-  benchmarks/factor_store_benchmark.cpp src/factor_store.cpp -o "$scratch/combined"
+  benchmarks/factor_store_benchmark.cpp "$scratch/combined.cpp" -o "$scratch/combined"
 for version in baseline combined; do
   taskset -c 4 "$scratch/$version" --case query-mixed-dense-25 --profile large --samples 61
   taskset -c 2,4,6 "$scratch/$version" --case concurrent-dense --profile large --samples 101
@@ -370,9 +372,9 @@ Release CTest 四项通过，并发用例连续运行 20 次。单元和并发�
 ```bash
 scratch=$(mktemp -d)
 git show 6384c32:src/factor_store.cpp > "$scratch/baseline.cpp"
-cp src/factor_store.cpp "$scratch/runs5.cpp"
+git show 5d083e2:src/factor_store.cpp > "$scratch/runs5.cpp"
 sed 's/min_dense_run_days = 5;/min_dense_run_days = 8;/' \
-  src/factor_store.cpp > "$scratch/runs8.cpp"
+  "$scratch/runs5.cpp" > "$scratch/runs8.cpp"
 for version in baseline runs5 runs8; do
   g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
     benchmarks/factor_store_benchmark.cpp "$scratch/$version.cpp" -o "$scratch/$version"
@@ -424,10 +426,11 @@ done
 ```bash
 scratch=$(mktemp -d)
 git show 5d083e2:src/factor_store.cpp > "$scratch/baseline.cpp"
+git show 0c683a3:src/factor_store.cpp > "$scratch/adaptive.cpp"
 g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
   benchmarks/factor_store_benchmark.cpp "$scratch/baseline.cpp" -o "$scratch/baseline"
 g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
-  benchmarks/factor_store_benchmark.cpp src/factor_store.cpp -o "$scratch/adaptive"
+  benchmarks/factor_store_benchmark.cpp "$scratch/adaptive.cpp" -o "$scratch/adaptive"
 for shape in day month history; do
   for coverage in 5 25 100; do
     for version in baseline adaptive; do
@@ -439,3 +442,57 @@ done
 ```
 
 Release CTest 四项通过，并发用例连续运行 20 次。单元和并发测试通过 ASan、UBSan，并发测试通过 TSan。验证覆盖同一批查询同时使用两条查找路径、重复轴、未登记和缺失数据，以及扫描期间与批量写入交错。
+
+## 稀疏块成段读取
+
+四个新场景共用一份稀疏数据。每个块在 33 个工作日中写入 32 日，跳过第 25 个工作日，全部查询都使用常规因子和合约规模。
+
+- `query-sparse-window` 请求块中间连续存放的 16 日。输入日期有周末间隔。
+- `query-sparse-gap` 请求有序的另一个 16 日窗口，其中一日缺失。
+- `query-sparse-shuffled` 请求全部已写入日期，按固定种子打乱日期顺序。
+- `query-sparse-point` 查询稀疏块内单个日期。
+
+同时复用两个满覆盖场景。`query-coverage-100-month` 请求同一年 32 日，`query-coverage-100-history` 请求相邻两年各 16 日。已有的稀疏乱序和稠密工作日场景用于复测其他查询路径。
+
+以 `0c683a3` 为基线。两个版本在 WSL2、AMD Ryzen 9 7940H 与 GCC 13.3.0 上以 `-O3 -DNDEBUG` 构建，固定使用逻辑 CPU 4。每个场景交替前后版本顺序运行七轮，每轮 61 次。下表为各轮 P50 和 P95 的中位数，单位为 µs。
+
+| 规模 | 场景 | 基线 P50 / P95 | 优化 P50 / P95 |
+| --- | --- | ---: | ---: |
+| small | `query-sparse-window` | 36.54 / 50.59 | 10.66 / 12.44 |
+| small | `query-sparse-gap` | 36.62 / 47.72 | 38.03 / 47.32 |
+| small | `query-sparse-shuffled` | 34.03 / 43.22 | 30.96 / 41.01 |
+| small | `query-sparse-point` | 6.06 / 7.26 | 6.10 / 6.62 |
+| small | `query-coverage-100-month` | 177.51 / 251.93 | 61.03 / 80.14 |
+| small | `query-coverage-100-history` | 425.29 / 565.90 | 138.19 / 193.81 |
+| small | `query-mixed-sparse` | 67.08 / 83.76 | 59.27 / 75.66 |
+| small | `query-dense-weekdays` | 69.98 / 86.47 | 74.34 / 104.22 |
+| large | `query-sparse-window` | 595.43 / 911.08 | 162.66 / 213.80 |
+| large | `query-sparse-gap` | 530.15 / 785.68 | 532.75 / 751.33 |
+| large | `query-sparse-shuffled` | 508.62 / 706.07 | 464.28 / 785.28 |
+| large | `query-sparse-point` | 91.80 / 119.10 | 91.86 / 116.04 |
+| large | `query-coverage-100-month` | 11069.30 / 15253.27 | 5521.49 / 6840.41 |
+| large | `query-coverage-100-history` | 29403.24 / 37891.14 | 14388.49 / 18814.33 |
+| large | `query-mixed-sparse` | 2390.68 / 3195.13 | 2460.92 / 3447.74 |
+| large | `query-dense-weekdays` | 2609.47 / 4508.82 | 2635.01 / 4708.63 |
+
+大规模 16 日窗口 P50 下降约 73%，32 日满覆盖下降约 50%，深历史下降约 51%。大规模单日和有序缺失场景的 P50 变化均小于 1%。大规模稀疏乱序和小规模稠密工作日场景的 P95 在这组测试中上升。
+
+三个对照场景使用每轮 101 次查询再跑七轮。小规模稠密工作日 P95 从 94.31 µs 变为 95.20 µs，大规模乱序全命中从 1.03 ms 变为 1.06 ms。大规模稀疏乱序且 50% 缺失的场景仍有较高的延迟，P50 从 2.39 ms 升至 2.65 ms，P95 从 3.83 ms 升至 4.33 ms。
+
+先按本文开头的 CMake 命令构建当前版本，再从仓库根目录运行以下对照。将 `large` 改为 `small` 可测小规模。
+
+```bash
+scratch=$(mktemp -d)
+git show 0c683a3:src/factor_store.cpp > "$scratch/baseline.cpp"
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
+  benchmarks/factor_store_benchmark.cpp "$scratch/baseline.cpp" -o "$scratch/baseline"
+cp build-bench/benchmarks/factor_store_benchmarks "$scratch/sparse-slice"
+for scenario in query-sparse-window query-sparse-gap query-sparse-shuffled \
+                query-sparse-point query-coverage-100-month query-coverage-100-history; do
+  for version in baseline sparse-slice; do
+    taskset -c 4 "$scratch/$version" --case "$scenario" --profile large --samples 61
+  done
+done
+```
+
+Release CTest 四项通过，并发用例连续通过 20 次。单元和并发测试通过 ASan、UBSan，并发测试通过 TSan。回归覆盖整块与局部切片、切片中间缺失、未命中日期、重复和乱序、跨位图边界、共享结果字和转换期间的查询。

@@ -36,6 +36,10 @@ set(expected_rows
     "query-coverage-5-history,small,3,65536,32,95"
     "query-coverage-25-history,small,3,65536,32,75"
     "query-coverage-100-history,small,3,65536,32,0"
+    "query-sparse-window,small,3,8192,32,0"
+    "query-sparse-gap,small,3,8192,32,6"
+    "query-sparse-shuffled,small,3,16384,32,0"
+    "query-sparse-point,small,3,512,32,0"
 )
 string(REPLACE "\r" "" output "${output}")
 foreach(row IN LISTS expected_rows)

@@ -181,7 +181,7 @@ void test_promotion_during_writes_to_other_factors() {
     const std::array<int, 7> days_per_month{31, 29, 31, 30, 31, 30, 10};
     constexpr TradingDate last_day = 20240710;
     const std::vector<double> original(codes.size(), 1.0);
-    std::vector<TradingDate> requested{date};
+    std::vector<TradingDate> requested;
     for (std::size_t month = 0; month < days_per_month.size(); ++month) {
         for (int day = 1; day <= days_per_month[month]; ++day) {
             const auto trading_date = 20240000 + static_cast<int>(month + 1) * 100 + day;

@@ -42,7 +42,8 @@ bool is_concurrent_case(std::string_view name) {
 }
 
 enum class Shape {
-    annual, daily, history_query, day_query, mixed_query, promotion_query, dense_runs, coverage_query
+    annual, daily, history_query, day_query, mixed_query, promotion_query, dense_runs,
+    coverage_query, sparse_slice_query
 };
 
 struct Scenario {
@@ -55,7 +56,7 @@ struct Scenario {
     bool deep_history = false;
 };
 
-constexpr std::array<Scenario, 27> scenarios{{
+constexpr std::array<Scenario, 31> scenarios{{
     {"year-new", Shape::annual, 0},
     {"year-overwrite", Shape::annual, days_per_year},
     {"year-backfill", Shape::annual, 189},
@@ -83,6 +84,10 @@ constexpr std::array<Scenario, 27> scenarios{{
     {"query-coverage-5-history", Shape::coverage_query, 32, 0, false, 5, true},
     {"query-coverage-25-history", Shape::coverage_query, 32, 0, false, 25, true},
     {"query-coverage-100-history", Shape::coverage_query, 32, 0, false, 100, true},
+    {"query-sparse-window", Shape::sparse_slice_query, 32},
+    {"query-sparse-gap", Shape::sparse_slice_query, 32},
+    {"query-sparse-shuffled", Shape::sparse_slice_query, 32},
+    {"query-sparse-point", Shape::sparse_slice_query, 32},
 }};
 
 struct Options {
@@ -288,6 +293,26 @@ void build_query_year(const Scenario& scenario, const std::vector<TradingDate>& 
                        [offset](double value) { return value + offset; });
         store.upsert_day(date, factors, contracts, day_values);
     };
+    if (scenario.shape == Shape::sparse_slice_query) {
+        constexpr std::size_t missing_day = 24;
+        for (std::size_t i = 0; i <= scenario.stored_days; ++i) {
+            if (i != missing_day) {
+                load(year[i]);
+                if (scenario.name == "query-sparse-shuffled") {
+                    requested.push_back({year[i], true});
+                }
+            }
+        }
+        if (scenario.name == "query-sparse-point") {
+            requested.push_back({year[17], true});
+        } else if (scenario.name != "query-sparse-shuffled") {
+            const std::size_t first = scenario.name == "query-sparse-gap" ? 16 : 7;
+            for (std::size_t i = first; i < first + 16; ++i) {
+                requested.push_back({year[i], i != missing_day});
+            }
+        }
+        return;
+    }
     if (scenario.shape == Shape::dense_runs) {
         // Jan 1 is Monday. Every eighth calendar date is missing in all three cases.
         const bool weekdays_only = scenario.name == "query-dense-weekdays";
@@ -357,7 +382,8 @@ Measurement query(const Scenario& scenario, const Options& options,
         year_days(2024, 0, scenario.shape != Shape::dense_runs), year_days(2025, 2)};
     const bool single_year = scenario.shape == Shape::day_query ||
                              scenario.shape == Shape::promotion_query ||
-                             scenario.shape == Shape::dense_runs;
+                             scenario.shape == Shape::dense_runs ||
+                             scenario.shape == Shape::sparse_slice_query;
     const auto year_count = single_year ? 1U : years.size();
 
     FactorStore store;
@@ -365,7 +391,8 @@ Measurement query(const Scenario& scenario, const Options& options,
     for (std::size_t y = 0; y < year_count; ++y) {
         build_query_year(scenario, years[y], factors, contracts, values, store, requested);
     }
-    if (scenario.missing_dates_per_year != 0 || scenario.name == "query-dense-shuffled") {
+    if (scenario.missing_dates_per_year != 0 || scenario.name == "query-dense-shuffled" ||
+        scenario.name == "query-sparse-shuffled") {
         permute(requested);
     }
     std::vector<TradingDate> dates;

@@ -15,6 +15,9 @@ find_package(Threads REQUIRED)
 
 add_library(factor_store
     src/factor_store.cpp
+    src/factor_store_query.cpp
+    src/factor_store_write.cpp
+    src/year_block.cpp
 )
 add_library(FactorStore::factor_store ALIAS factor_store)
 

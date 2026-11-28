@@ -253,6 +253,51 @@ void test_query_bitmap_sharing_and_single_dates() {
     compare_query(store, expected, factors, contracts, runs);
 }
 
+void test_sparse_slice_queries() {
+    FactorStore store;
+    const auto calendar = leap_year_dates();
+    const auto nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<std::string> factors{"sparse"};
+    const std::vector<std::string> contracts{"IF", "IF", "absent"};
+    std::vector<TradingDate> stored;
+    Model expected;
+    for (int year : {2000, 2004}) {
+        std::vector<DailyValue> points;
+        for (std::size_t i = 0; i < 75; ++i) {
+            const auto date = calendar[2 * i] + (year - 2000) * 10000;
+            const double value = i == 7 ? nan : (i == 3 ? 0.0 : static_cast<double>(i + year));
+            points.push_back({date, value});
+            expected[{"sparse", "IF", date}] = value;
+            if (year == 2000) {
+                stored.push_back(date);
+            }
+        }
+        store.upsert_year("sparse", "IF", year, points);
+    }
+    compare_query(store, expected, factors, contracts, stored);
+
+    // The leading date and neighboring contract rows shift the output bitmap boundaries.
+    std::vector<TradingDate> requested{19991231};
+    requested.insert(requested.end(), stored.begin() + 3, stored.begin() + 68);
+    for (std::size_t i = 20; i < 36; ++i) {
+        requested.push_back(stored[i] + 40000);
+    }
+    requested.push_back(20050101);
+    compare_query(store, expected, factors, contracts, requested);
+
+    // A mismatch inside an otherwise ordered slice must preserve all the other hits.
+    auto gap = requested;
+    gap[9] = calendar[23];
+    compare_query(store, expected, factors, contracts, gap);
+    auto repeated = requested;
+    repeated[2] = repeated[1];
+    compare_query(store, expected, factors, contracts, repeated);
+    std::swap(requested[1], requested[9]);
+    compare_query(store, expected, factors, contracts, requested);
+    compare_query(store, expected, factors, contracts,
+                  std::vector<TradingDate>(calendar.begin() + 200, calendar.begin() + 216));
+}
+
 void test_query_with_mixed_block_coverage() {
     FactorStore store;
     std::vector<std::string> contracts;
@@ -425,6 +470,7 @@ int main() {
         test_single_value_block_expands_in_date_order();
         test_full_leap_year();
         test_query_bitmap_sharing_and_single_dates();
+        test_sparse_slice_queries();
         test_query_with_mixed_block_coverage();
         test_pending_promotions_survive_writes_and_factor_deletion();
         test_delete_and_name_ownership();
