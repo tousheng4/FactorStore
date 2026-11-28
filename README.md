@@ -22,17 +22,20 @@ FactorStore/
 ```bash
 cmake -S . -B build
 cmake --build build
-ctest --test-dir build --output-on-failure
+(cd build && ctest --output-on-failure)
 ```
 
-性能测试默认关闭，可按需启用：
+性能基准默认关闭。以下命令在 Linux 或 WSL 下构建 Release 版并运行：
 
 ```bash
-cmake -S . -B build-bench -DFACTOR_STORE_BUILD_BENCHMARKS=ON
-cmake --build build-bench
+cmake -S . -B build-bench -DCMAKE_BUILD_TYPE=Release -DFACTOR_STORE_BUILD_BENCHMARKS=ON
+cmake --build build-bench --parallel
+./build-bench/benchmarks/factor_store_benchmarks --profile large --samples 61
 ```
 
-## 当前进度
+场景、测量口径和布局对比见[性能基准报告](docs/benchmarks.md)。
 
-内存版已实现五项因子存储操作，测试覆盖批量覆盖、跨年查询、非法批次、删除和同名重建。用法与运行示例见[接口文档](docs/api.md)，后续性能基准与优化见[实现路线](docs/implementation-roadmap.md)。
+## 首版交付
+
+内存版已实现五项因子存储操作。年度块按有效日期数选择稀疏或稠密表示。使用方法、设计决策和维护入口见[项目文档](docs/README.md)。
 

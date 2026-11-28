@@ -149,17 +149,29 @@ void test_full_leap_year() {
         }
     }
     Model expected;
+    std::vector<DailyValue> annual;
     for (std::size_t i = 0; i < dates.size(); ++i) {
-        const double value = static_cast<double>(i);
+        if (i == 50) {
+            continue;
+        }
+        const double value = i == 51 ? std::numeric_limits<double>::quiet_NaN()
+                                      : static_cast<double>(i);
         store.upsert_day(dates[i], {"factor"}, {"contract"}, {value});
         expected[{"factor", "contract", dates[i]}] = value;
+        annual.push_back({dates[i], value});
+        expected[{"annual", "contract", dates[i]}] = value;
+        expected[{"merged", "contract", dates[i]}] = value;
     }
+    store.upsert_year("annual", "contract", 2000, annual);
+    const auto middle = annual.begin() + 180;
+    store.upsert_year("merged", "contract", 2000, std::vector<DailyValue>(annual.begin(), middle));
+    store.upsert_year("merged", "contract", 2000, std::vector<DailyValue>(middle, annual.end()));
     store.upsert_year("factor", "contract", 2000, {{20001231, 42.0}, {20000101, 43.0}});
     expected[{"factor", "contract", 20001231}] = 42.0;
     expected[{"factor", "contract", 20000101}] = 43.0;
     std::reverse(dates.begin(), dates.end());
     dates.push_back(20010101);
-    compare_query(store, expected, {"factor"}, {"contract"}, dates);
+    compare_query(store, expected, {"factor", "annual", "merged"}, {"contract"}, dates);
 }
 
 void test_delete_and_name_ownership() {

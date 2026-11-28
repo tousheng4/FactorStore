@@ -20,6 +20,7 @@ using DayIndex = std::uint16_t;
 using BlockKey = std::uint64_t;
 
 constexpr std::size_t max_days_in_year = 366;
+constexpr std::size_t dense_threshold = 192;
 
 struct IndexedDate {
     int year;
@@ -96,9 +97,22 @@ struct IndexedValue {
     double value;
 };
 
+struct DenseBlock {
+    std::array<double, max_days_in_year> values{};
+    std::bitset<max_days_in_year> present;
+
+    void upsert(DayIndex day, double value) noexcept {
+        values[day] = value;
+        present[day] = true;
+    }
+};
+
 class YearBlock {
 public:
     [[nodiscard]] std::optional<double> find(DayIndex day) const {
+        if (dense_) {
+            return dense_->present[day] ? std::optional<double>(dense_->values[day]) : std::nullopt;
+        }
         const auto position = std::lower_bound(days_.begin(), days_.end(), day);
         if (position == days_.end() || *position != day) {
             return std::nullopt;
@@ -107,6 +121,10 @@ public:
     }
 
     void upsert(DayIndex day, double value) {
+        if (dense_) {
+            dense_->upsert(day, value);
+            return;
+        }
         const auto position = std::lower_bound(days_.begin(), days_.end(), day);
         const auto index = position - days_.begin();
         if (position != days_.end() && *position == day) {
@@ -114,6 +132,11 @@ public:
             return;
         }
 
+        if (days_.size() + 1 >= dense_threshold) {
+            promote();
+            dense_->upsert(day, value);
+            return;
+        }
         if (days_.size() == days_.capacity() || values_.size() == values_.capacity()) {
             const auto capacity = std::min(max_days_in_year, 2 * days_.size() + 1);
             // Complete both allocations before changing either array's length.
@@ -125,6 +148,16 @@ public:
     }
 
     void merge(const std::vector<IndexedValue>& points) {
+        if (!dense_ && points.size() >= dense_threshold) {
+            promote();
+        }
+        if (dense_) {
+            for (const auto& point : points) {
+                dense_->upsert(point.day, point.value);
+            }
+            return;
+        }
+
         YearBlock merged;
         const auto capacity = std::min(max_days_in_year, days_.size() + points.size());
         merged.days_.reserve(capacity);
@@ -145,10 +178,24 @@ public:
             merged.append(days_[current], values_[current]);
             ++current;
         }
+        if (merged.days_.size() >= dense_threshold) {
+            merged.promote();
+        }
         *this = std::move(merged);
     }
 
 private:
+    void promote() {
+        auto dense = std::make_unique<DenseBlock>();
+        for (std::size_t i = 0; i < days_.size(); ++i) {
+            dense->upsert(days_[i], values_[i]);
+        }
+        // Publish the dense buffer after allocation and release both sparse arrays.
+        dense_ = std::move(dense);
+        std::vector<DayIndex>().swap(days_);
+        std::vector<double>().swap(values_);
+    }
+
     void append(DayIndex day, double value) {
         days_.push_back(day);
         values_.push_back(value);
@@ -156,6 +203,7 @@ private:
 
     std::vector<DayIndex> days_;
     std::vector<double> values_;
+    std::unique_ptr<DenseBlock> dense_;
 };
 
 struct Factor {

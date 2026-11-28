@@ -1,6 +1,6 @@
 # FactorStore 接口文档
 
-公开接口定义在 `factor_store/factor_store.h`，位于 `factor_store` 命名空间，使用 C++17。五项操作由内存版实现，调用方可以通过 CMake 目标 `FactorStore::factor_store` 链接。
+公开接口定义在 [factor_store/factor_store.h](../include/factor_store/factor_store.h)，位于 `factor_store` 命名空间，使用 C++17。在同一 CMake 构建中引入本项目后，调用方可链接 `FactorStore::factor_store`。
 
 ## 数据约定
 
@@ -8,7 +8,7 @@
 - `TradingDate` 是按 `YYYYMMDD` 编码的整数，例如 `20260227`。支持公历 1 至 9999 年并校验闰日。交易日历由调用方管理，库校验公历日期。
 - `0.0` 和 `NaN` 都可写入，且都属于存在的值。查询用有效位图区分存在与缺失。
 - 输入在调用期间借用。调用返回后，调用方可以释放或修改输入。查询结果拥有独立的缓冲区。同一实例的并发访问由调用方同步。
-- 每个 `FactorStore` 实例独立持有数据，实例禁止复制，析构时释放其中的数据。
+- 每个 `FactorStore` 实例在构造后为空，独立持有数据，析构时释放数据。实例禁止复制和移动。
 
 ## 年度批量写入
 
@@ -103,3 +103,14 @@ int main() {
                : 1;
 }
 ```
+
+在 Linux 或 WSL 上，将示例保存为仓库根目录的 `example.cpp`，然后构建静态库并运行：
+
+```bash
+cmake -S . -B build-example -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+cmake --build build-example --target factor_store
+g++ -std=c++17 -Iinclude example.cpp build-example/libfactor_store.a -o build-example/example
+./build-example/example
+```
+
+示例校验通过时以状态码 `0` 退出。
