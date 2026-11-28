@@ -39,11 +39,12 @@ struct Scenario {
     bool drain_promotions = false;
 };
 
-constexpr std::array<Scenario, 14> scenarios{{
+constexpr std::array<Scenario, 15> scenarios{{
     {"year-new", Shape::annual, 0},
     {"year-overwrite", Shape::annual, days_per_year},
     {"year-backfill", Shape::annual, 189},
     {"day-new", Shape::daily, 0},
+    {"day-second", Shape::daily, 1},
     {"day-append", Shape::daily, 64},
     {"day-overwrite", Shape::daily, 64},
     {"day-threshold", Shape::daily, 191},

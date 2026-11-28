@@ -185,3 +185,48 @@ done
 ```
 
 最终 Release 的三项 CTest 均通过，功能用例覆盖待转换块的查询、年度写入完成转换、删除与同名重建，以及无关日写推进队列。核心单元测试同时通过 ASan 和 UBSan。
+
+## 单值块内联对照
+
+基线为 `bd756ec`，稀疏块首次写入时即为日期和值分别分配数组。优化版把第一条记录直接存进年度块，第二个不同日期才构造 SoA 数组。两版使用同一份基准程序，GCC 13.3.0、`-O3 -DNDEBUG`，固定在 WSL2 的逻辑 CPU 3。每个场景交替运行三轮，每轮 31 批。延迟为各指标的三轮中位数，单位为 µs。
+
+| 规模 | 场景 | P50 基线 → 优化 | P95 基线 → 优化 | 峰值 RSS MiB |
+| --- | --- | ---: | ---: | ---: |
+| small | `day-new` | 28.29 → 16.86 | 36.97 → 31.64 | 3.91 → 3.91 |
+| small | `day-second` | 24.50 → 18.39 | 28.32 → 20.20 | 3.91 → 3.91 |
+| small | `day-append` | 8.54 → 8.10 | 11.60 → 11.14 | 4.54 → 4.53 |
+| small | `day-overwrite` | 10.10 → 9.98 | 13.95 → 12.04 | 4.54 → 4.54 |
+| small | `day-threshold` | 36.69 → 32.76 | 46.51 → 61.38 | 4.98 → 4.93 |
+| small | `query-day` | 4.26 → 4.15 | 4.48 → 4.39 | 3.94 → 3.87 |
+| small | `query-history` | 44.63 → 45.89 | 59.64 → 76.07 | 4.30 → 4.30 |
+| small | `query-mixed-sparse` | 76.80 → 66.80 | 143.56 → 107.72 | 4.75 → 4.68 |
+| small | `query-mixed-dense` | 62.92 → 61.17 | 163.54 → 95.09 | 6.96 → 6.96 |
+| large | `day-new` | 453.87 → 208.54 | 564.86 → 262.55 | 4.91 → 4.48 |
+| large | `day-second` | 224.38 → 207.19 | 322.67 → 309.50 | 4.91 → 4.75 |
+| large | `day-append` | 197.50 → 165.02 | 517.08 → 376.55 | 12.35 → 12.25 |
+| large | `day-overwrite` | 252.71 → 231.19 | 577.57 → 486.42 | 12.34 → 12.24 |
+| large | `day-threshold` | 274.08 → 290.73 | 443.18 → 474.43 | 20.13 → 19.80 |
+| large | `query-day` | 58.81 → 40.99 | 84.11 → 58.91 | 4.94 → 4.56 |
+| large | `query-history` | 173.04 → 173.44 | 232.13 → 319.71 | 6.41 → 6.39 |
+| large | `query-mixed-sparse` | 1423.79 → 1457.04 | 3274.01 → 2954.01 | 16.67 → 16.25 |
+| large | `query-mixed-dense` | 3295.44 → 3407.45 | 4807.01 → 4563.32 | 43.72 → 43.24 |
+
+- 大型 `day-new` 一次创建 6,144 个块，P50 从约 454 µs 降至 209 µs。在同样大小的临时分配计数探针中，首次日写的 `operator new` 调用由 19,170 次降为 6,882 次，恰好少 12,288 次。
+- `day-second` 在同一批块先各写入一天，再测第二天的写入。大型场景的 P50 从约 224 µs 降至 207 µs，第二次写入的分配计数仍为 12,571 次。前两天累计节省 12,288 次分配。
+- 大型单日查询 P50 从约 58.81 µs 降至 40.99 µs。跨年查询 P50 接近，本轮 P95 从约 232 µs 升到 320 µs。大型稠密无序查询和跨阈值日写的 P50 也小幅增加，收益主要集中在单值块。
+
+用开头的 Release 命令构建后，可运行 `day-new`、`day-second` 和 `query-day`。要对比基线，可在包含 `bd756ec` 的 Git 工作副本中，用当前的基准源码分别链接两版实现。
+
+```bash
+scratch=$(mktemp -d)
+git show bd756ec:src/factor_store.cpp > "$scratch/baseline.cpp"
+g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
+  "$scratch/baseline.cpp" -o "$scratch/baseline"
+g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
+  src/factor_store.cpp -o "$scratch/optimized"
+for order in 'baseline optimized' 'optimized baseline' 'baseline optimized'; do
+  for version in $order; do
+    taskset -c 3 "$scratch/$version" --case day-new --profile large --samples 31
+  done
+done
+```

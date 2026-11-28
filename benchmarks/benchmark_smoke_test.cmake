@@ -13,6 +13,7 @@ set(expected_rows
     "year-overwrite,small,3,252,252,-"
     "year-backfill,small,3,63,189,-"
     "day-new,small,3,512,0,-"
+    "day-second,small,3,512,1,-"
     "day-append,small,3,512,64,-"
     "day-overwrite,small,3,512,64,-"
     "day-threshold,small,3,512,191,-"

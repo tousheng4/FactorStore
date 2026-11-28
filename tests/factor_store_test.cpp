@@ -150,6 +150,24 @@ std::vector<TradingDate> leap_year_dates() {
     return dates;
 }
 
+void test_single_value_block_expands_in_date_order() {
+    FactorStore store;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    store.upsert_year("annual", "IF", 2024, {{20240103, nan}});
+    store.upsert_day(20240101, {"daily"}, {"IF"}, {0.0});
+    const std::vector<std::string> factors{"annual", "daily"};
+    const std::vector<TradingDate> dates{20240103, 20240101, 20240102, 20240103};
+    Model expected{{{"annual", "IF", 20240103}, nan}, {{"daily", "IF", 20240101}, 0.0}};
+    compare_query(store, expected, factors, {"IF"}, dates);
+
+    store.upsert_day(20240101, factors, {"IF"}, {9.0, 2.0});
+    store.upsert_year("daily", "IF", 2024, {{20240103, nan}});
+    expected[{"annual", "IF", 20240101}] = 9.0;
+    expected[{"daily", "IF", 20240101}] = 2.0;
+    expected[{"daily", "IF", 20240103}] = nan;
+    compare_query(store, expected, factors, {"IF"}, dates);
+}
+
 void test_full_leap_year() {
     FactorStore store;
     auto dates = leap_year_dates();
@@ -313,6 +331,7 @@ int main() {
     try {
         test_batches_and_query_order();
         test_empty_and_invalid_batches();
+        test_single_value_block_expands_in_date_order();
         test_full_leap_year();
         test_pending_promotions_survive_writes_and_factor_deletion();
         test_delete_and_name_ownership();

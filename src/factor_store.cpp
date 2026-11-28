@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 
 namespace factor_store {
 namespace {
@@ -24,6 +25,7 @@ constexpr std::size_t max_days_in_year = 366;
 constexpr std::size_t dense_threshold = 192;
 constexpr std::size_t max_promotions_per_daily_batch = 256;
 constexpr std::size_t cells_per_promotion = 16;
+constexpr DayIndex empty_day = static_cast<DayIndex>(max_days_in_year);
 
 struct IndexedDate {
     int year;
@@ -96,8 +98,33 @@ struct BlockKeyHash {
 };
 
 struct IndexedValue {
-    DayIndex day;
-    double value;
+    DayIndex day = empty_day;
+    double value = 0.0;
+};
+
+struct SparseView {
+    const DayIndex* days;
+    const double* values;
+    std::size_t size;
+};
+
+struct SparseBlock {
+    void reserve(std::size_t capacity) {
+        days.reserve(capacity);
+        values.reserve(capacity);
+    }
+
+    void append(DayIndex day, double value) {
+        days.push_back(day);
+        values.push_back(value);
+    }
+
+    [[nodiscard]] SparseView view() const noexcept {
+        return {days.data(), values.data(), days.size()};
+    }
+
+    std::vector<DayIndex> days;
+    std::vector<double> values;
 };
 
 struct QueryDay {
@@ -142,6 +169,8 @@ struct DenseBlock {
     }
 };
 
+using DenseOwner = std::unique_ptr<DenseBlock>;
+
 // Links live in map nodes, whose addresses stay stable when the map rehashes.
 struct PromotionLink {
     PromotionLink() = default;
@@ -172,140 +201,179 @@ public:
     }
 
     void read_many(QueryDays& requested, std::size_t offset, QueryResult& result) const {
-        if (const auto* dense = dense_.get()) {
+        if (const auto* owner = std::get_if<DenseOwner>(&storage_)) {
+            const DenseBlock& dense = **owner;
             for (const auto& request : requested.days) {
-                if (dense->present[request.day]) {
-                    set_query_value(result, offset + request.position, dense->values[request.day]);
+                if (dense.present[request.day]) {
+                    set_query_value(result, offset + request.position, dense.values[request.day]);
+                }
+            }
+            return;
+        }
+        if (const auto* single = std::get_if<IndexedValue>(&storage_)) {
+            for (const auto& request : requested.days) {
+                if (request.day == single->day) {
+                    set_query_value(result, offset + request.position, single->value);
                 }
             }
             return;
         }
 
+        const auto& sparse = std::get<SparseBlock>(storage_);
         // For many requested dates, amortize a single pass over the sparse block.
         constexpr std::size_t min_merge_dates = 24;
         if (requested.days.size() >= min_merge_dates &&
-            (requested.days.size() >= days_.size() / 4 ||
-             (linked() && requested.days.size() >= days_.size() / 8))) {
+            (requested.days.size() >= sparse.days.size() / 4 ||
+             (linked() && requested.days.size() >= sparse.days.size() / 8))) {
             requested.sort_if_needed();
-            read_sparse_in_order(requested.days, offset, result);
+            read_sparse_in_order(sparse, requested.days, offset, result);
             return;
         }
 
         for (const auto& request : requested.days) {
-            const auto day = std::lower_bound(days_.begin(), days_.end(), request.day);
-            if (day != days_.end() && *day == request.day) {
-                set_query_value(result, offset + request.position, values_[day - days_.begin()]);
+            const auto day = std::lower_bound(sparse.days.begin(), sparse.days.end(), request.day);
+            if (day != sparse.days.end() && *day == request.day) {
+                set_query_value(result, offset + request.position,
+                                sparse.values[day - sparse.days.begin()]);
             }
         }
     }
 
     // A new date that crosses the threshold makes this block eligible for the queue.
     bool upsert(DayIndex day, double value) {
-        if (dense_) {
-            dense_->upsert(day, value);
+        if (auto* single = std::get_if<IndexedValue>(&storage_)) {
+            if (single->day == empty_day || single->day == day) {
+                *single = {day, value};
+            } else {
+                expand_single(*single, {day, value});
+            }
             return false;
         }
-        const auto position = days_.empty() || day > days_.back()
-                                  ? days_.end()
-                                  : std::lower_bound(days_.begin(), days_.end(), day);
-        const auto index = position - days_.begin();
-        if (position != days_.end() && *position == day) {
-            values_[index] = value;
+        if (auto* owner = std::get_if<DenseOwner>(&storage_)) {
+            (*owner)->upsert(day, value);
+            return false;
+        }
+        auto& sparse = std::get<SparseBlock>(storage_);
+        const auto position = day > sparse.days.back()
+                                  ? sparse.days.end()
+                                  : std::lower_bound(sparse.days.begin(), sparse.days.end(), day);
+        const auto index = position - sparse.days.begin();
+        if (position != sparse.days.end() && *position == day) {
+            sparse.values[index] = value;
             return false;
         }
 
-        if (days_.size() == days_.capacity() || values_.size() == values_.capacity()) {
-            const auto capacity = std::min(max_days_in_year, 2 * days_.size() + 1);
+        if (sparse.days.size() == sparse.days.capacity() ||
+            sparse.values.size() == sparse.values.capacity()) {
+            const auto capacity = std::min(max_days_in_year, 2 * sparse.days.size() + 1);
             // Complete both allocations before changing either array's length.
-            days_.reserve(capacity);
-            values_.reserve(capacity);
+            sparse.reserve(capacity);
         }
-        days_.insert(days_.begin() + index, day);
-        values_.insert(values_.begin() + index, value);
-        return days_.size() == dense_threshold;
+        sparse.days.insert(sparse.days.begin() + index, day);
+        sparse.values.insert(sparse.values.begin() + index, value);
+        return sparse.days.size() == dense_threshold;
     }
 
     void merge(const std::vector<IndexedValue>& points) {
-        if (!dense_ && points.size() >= dense_threshold) {
-            promote();
+        if (auto* single = std::get_if<IndexedValue>(&storage_);
+            single && points.size() == 1 &&
+            (single->day == empty_day || single->day == points.front().day)) {
+            *single = points.front();
+            return;
         }
-        if (dense_) {
+        auto* owner = std::get_if<DenseOwner>(&storage_);
+        if (!owner && points.size() >= dense_threshold) {
+            promote();
+            owner = std::get_if<DenseOwner>(&storage_);
+        }
+        if (owner) {
             for (const auto& point : points) {
-                dense_->upsert(point.day, point.value);
+                (*owner)->upsert(point.day, point.value);
             }
             return;
         }
 
-        YearBlock merged;
-        const auto capacity = std::min(max_days_in_year, days_.size() + points.size());
-        merged.days_.reserve(capacity);
-        merged.values_.reserve(capacity);
+        const auto old = sparse_view();
+        SparseBlock merged;
+        merged.reserve(std::min(max_days_in_year, old.size + points.size()));
 
         std::size_t current = 0;
         for (const auto& point : points) {
-            while (current < days_.size() && days_[current] < point.day) {
-                merged.append(days_[current], values_[current]);
+            while (current < old.size && old.days[current] < point.day) {
+                merged.append(old.days[current], old.values[current]);
                 ++current;
             }
-            if (current < days_.size() && days_[current] == point.day) {
+            if (current < old.size && old.days[current] == point.day) {
                 ++current;
             }
             merged.append(point.day, point.value);
         }
-        while (current < days_.size()) {
-            merged.append(days_[current], values_[current]);
+        while (current < old.size) {
+            merged.append(old.days[current], old.values[current]);
             ++current;
         }
-        if (merged.days_.size() >= dense_threshold) {
-            merged.promote();
-        }
-        days_.swap(merged.days_);
-        values_.swap(merged.values_);
-        dense_.swap(merged.dense_);
-        if (dense_) {
-            unlink();
+        if (merged.days.size() >= dense_threshold) {
+            install_dense(merged.view());
+        } else {
+            storage_.emplace<SparseBlock>(std::move(merged));
         }
     }
 
 private:
     friend class PromotionQueue;
 
-    void read_sparse_in_order(const std::vector<QueryDay>& requested, std::size_t offset,
-                              QueryResult& result) const {
-        auto day = std::lower_bound(days_.begin(), days_.end(), requested.front().day);
+    static void read_sparse_in_order(const SparseBlock& sparse,
+                                     const std::vector<QueryDay>& requested,
+                                     std::size_t offset, QueryResult& result) {
+        auto day = std::lower_bound(sparse.days.begin(), sparse.days.end(), requested.front().day);
         for (const auto& request : requested) {
-            while (day != days_.end() && *day < request.day) {
+            while (day != sparse.days.end() && *day < request.day) {
                 ++day;
             }
-            if (day == days_.end()) {
+            if (day == sparse.days.end()) {
                 break;
             }
             if (*day == request.day) {
-                set_query_value(result, offset + request.position, values_[day - days_.begin()]);
+                set_query_value(result, offset + request.position,
+                                sparse.values[day - sparse.days.begin()]);
             }
         }
     }
 
-    void promote() {
-        auto dense = std::make_unique<DenseBlock>();
-        for (std::size_t i = 0; i < days_.size(); ++i) {
-            dense->upsert(days_[i], values_[i]);
+    void expand_single(IndexedValue first, IndexedValue second) {
+        if (second.day < first.day) {
+            std::swap(first, second);
         }
-        // Publish the dense buffer after allocation and release both sparse arrays.
-        dense_ = std::move(dense);
-        std::vector<DayIndex>().swap(days_);
-        std::vector<double>().swap(values_);
+        SparseBlock sparse;
+        sparse.reserve(3);
+        sparse.append(first.day, first.value);
+        sparse.append(second.day, second.value);
+        storage_.emplace<SparseBlock>(std::move(sparse));
+    }
+
+    [[nodiscard]] SparseView sparse_view() const {
+        if (const auto* single = std::get_if<IndexedValue>(&storage_)) {
+            return {&single->day, &single->value, single->day == empty_day ? 0U : 1U};
+        }
+        return std::get<SparseBlock>(storage_).view();
+    }
+
+    void promote() {
+        install_dense(sparse_view());
+    }
+
+    void install_dense(SparseView old) {
+        auto dense = std::make_unique<DenseBlock>();
+        for (std::size_t i = 0; i < old.size; ++i) {
+            dense->upsert(old.days[i], old.values[i]);
+        }
+        // Publish after allocation and release whichever sparse representation was active.
+        storage_.emplace<DenseOwner>(std::move(dense));
         unlink();
     }
 
-    void append(DayIndex day, double value) {
-        days_.push_back(day);
-        values_.push_back(value);
-    }
-
-    std::vector<DayIndex> days_;
-    std::vector<double> values_;
-    std::unique_ptr<DenseBlock> dense_;
+    // Keep the first value in the block itself, then use SoA for multi-value sparse blocks.
+    std::variant<IndexedValue, SparseBlock, DenseOwner> storage_;
 };
 
 class PromotionQueue {
