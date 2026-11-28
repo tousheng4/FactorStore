@@ -174,6 +174,8 @@ struct DenseBlock {
 using DenseOwner = std::unique_ptr<DenseBlock>;
 
 // Links live in map nodes, whose addresses stay stable when the map rehashes.
+struct Factor;
+
 struct PromotionLink {
     PromotionLink() = default;
     PromotionLink(const PromotionLink&) = delete;
@@ -199,6 +201,8 @@ struct PromotionLink {
 class YearBlock : private PromotionLink {
 public:
     ~YearBlock() {
+        // A published block is destroyed with exclusive access to the catalog.
+        // A newly inserted block that fails to initialize has no queue entry.
         unlink();
     }
 
@@ -226,7 +230,8 @@ public:
         constexpr std::size_t min_merge_dates = 24;
         if (requested.days.size() >= min_merge_dates &&
             (requested.days.size() >= sparse.days.size() / 4 ||
-             (linked() && requested.days.size() >= sparse.days.size() / 8))) {
+             (sparse.days.size() >= dense_threshold &&
+              requested.days.size() >= sparse.days.size() / 8))) {
             requested.sort_if_needed();
             read_sparse_in_order(sparse, requested.days, offset, result);
             return;
@@ -276,15 +281,17 @@ public:
         return sparse.days.size() == dense_threshold;
     }
 
-    void merge(const std::vector<IndexedValue>& points) {
+    // Return whether the caller needs to cancel a pending promotion.
+    bool merge(const std::vector<IndexedValue>& points) {
         if (auto* single = std::get_if<IndexedValue>(&storage_);
             single && points.size() == 1 &&
             (single->day == empty_day || single->day == points.front().day)) {
             *single = points.front();
-            return;
+            return false;
         }
         auto* owner = std::get_if<DenseOwner>(&storage_);
-        if (!owner && points.size() >= dense_threshold) {
+        const bool promote_first = !owner && points.size() >= dense_threshold;
+        if (promote_first) {
             promote();
             owner = std::get_if<DenseOwner>(&storage_);
         }
@@ -292,7 +299,7 @@ public:
             for (const auto& point : points) {
                 (*owner)->upsert(point.day, point.value);
             }
-            return;
+            return promote_first;
         }
 
         const auto old = sparse_view();
@@ -316,13 +323,19 @@ public:
         }
         if (merged.days.size() >= dense_threshold) {
             install_dense(merged.view());
-        } else {
-            storage_.emplace<SparseBlock>(std::move(merged));
+            return true;
         }
+        storage_.emplace<SparseBlock>(std::move(merged));
+        return false;
     }
 
 private:
     friend class PromotionQueue;
+
+    [[nodiscard]] bool ready_for_promotion() const noexcept {
+        const auto* sparse = std::get_if<SparseBlock>(&storage_);
+        return sparse && sparse->days.size() >= dense_threshold;
+    }
 
     static void read_sparse_in_order(const SparseBlock& sparse,
                                      const std::vector<QueryDay>& requested,
@@ -371,37 +384,61 @@ private:
         }
         // Publish after allocation and release whichever sparse representation was active.
         storage_.emplace<DenseOwner>(std::move(dense));
-        unlink();
     }
 
     // Keep the first value in the block itself, then use SoA for multi-value sparse blocks.
     std::variant<IndexedValue, SparseBlock, DenseOwner> storage_;
+    // Stays set while a task is in flight so cancel() can prevent a later requeue.
+    Factor* pending_owner_ = nullptr;
 };
 
 class PromotionQueue {
 public:
-    void enqueue(YearBlock& block) noexcept {
+    void enqueue(YearBlock& block, Factor& owner) {
+        const std::lock_guard lock(mutex_);
+        block.pending_owner_ = &owner;
+        link(block);
+    }
+
+    void cancel(YearBlock& block) {
+        const std::lock_guard lock(mutex_);
+        block.unlink();
+        block.pending_owner_ = nullptr;
+    }
+
+    void run_after_daily_write(std::size_t cells);
+
+private:
+    struct Task {
+        YearBlock* block;
+        Factor* factor;
+    };
+
+    void link(YearBlock& block) noexcept {
         block.previous = head_.previous;
         block.next = &head_;
         head_.previous->next = &block;
         head_.previous = &block;
     }
 
-    void run_after_daily_write(std::size_t cells) noexcept {
-        const auto budget = std::min(max_promotions_per_daily_batch,
-                                     1 + (cells - 1) / cells_per_promotion);
-        for (std::size_t i = 0; i < budget && head_.next != &head_; ++i) {
-            auto& block = static_cast<YearBlock&>(*head_.next);
-            try {
-                block.promote();
-            } catch (const std::bad_alloc&) {
-                // The write already succeeded. Leave this block queued and readable.
-                return;
-            }
+    std::optional<Task> take() {
+        const std::lock_guard lock(mutex_);
+        if (head_.next == &head_) {
+            return std::nullopt;
+        }
+        auto& block = static_cast<YearBlock&>(*head_.next);
+        block.unlink();
+        return Task{&block, block.pending_owner_};
+    }
+
+    void requeue(const Task& task) {
+        const std::lock_guard lock(mutex_);
+        if (task.block->pending_owner_ == task.factor) {
+            link(*task.block);
         }
     }
 
-private:
+    std::mutex mutex_;
     PromotionLink head_;
 };
 
@@ -422,13 +459,41 @@ struct Factor {
     }
 
     const std::string name;
+    mutable std::shared_mutex mutex;
     std::unordered_map<BlockKey, YearBlock, BlockKeyHash> blocks;
 };
+
+void PromotionQueue::run_after_daily_write(std::size_t cells) {
+    const auto budget = std::min(max_promotions_per_daily_batch,
+                                 1 + (cells - 1) / cells_per_promotion);
+    for (std::size_t i = 0; i < budget; ++i) {
+        const auto task = take();
+        if (!task) {
+            return;
+        }
+        // The catalog pins this task's owner. Only this factor is locked during conversion.
+        const std::unique_lock lock(task->factor->mutex, std::try_to_lock);
+        if (!lock) {
+            requeue(*task);
+            continue;
+        }
+        try {
+            if (task->block->ready_for_promotion()) {
+                task->block->promote();
+            }
+        } catch (const std::bad_alloc&) {
+            // The write already succeeded. Keep the sparse block readable and retry later.
+            requeue(*task);
+            return;
+        }
+        cancel(*task->block);
+    }
+}
 
 }  // namespace
 
 struct FactorStore::Impl {
-    mutable std::shared_mutex mutex;
+    mutable std::shared_mutex catalog_mutex;
 
     // Destroy the factors and their links before destroying the queue sentinel.
     PromotionQueue promotions;
@@ -437,6 +502,19 @@ struct FactorStore::Impl {
     std::unordered_map<std::string_view, ContractId> contract_ids;
     std::vector<std::unique_ptr<Factor>> factors;
     std::unordered_map<std::string_view, FactorId> factor_ids;
+
+    template <class Lock>
+    std::vector<Lock> lock_factors(std::vector<FactorId> ids) const {
+        // The caller holds the catalog lock, so the order is stable while acquiring locks.
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        std::vector<Lock> locks;
+        locks.reserve(ids.size());
+        for (const auto id : ids) {
+            locks.emplace_back(factors[id]->mutex);
+        }
+        return locks;
+    }
 
     ContractId get_or_add_contract(std::string_view name) {
         const auto existing = contract_ids.find(name);
@@ -510,10 +588,29 @@ void FactorStore::upsert_year(std::string_view factor,
         return a.day < b.day;
     });
 
-    const std::unique_lock lock(impl_->mutex);
-    const auto key = block_key(impl_->get_or_add_contract(contract), year);
+    const auto write = [&](Factor& target, ContractId contract_id) {
+        target.write_block(block_key(contract_id, year), [&](YearBlock& block) {
+            if (block.merge(indexed)) {
+                impl_->promotions.cancel(block);
+            }
+        });
+    };
+    {
+        const std::shared_lock catalog_lock(impl_->catalog_mutex);
+        const auto contract_entry = impl_->contract_ids.find(contract);
+        const auto factor_entry = impl_->factor_ids.find(factor);
+        if (contract_entry != impl_->contract_ids.end() && factor_entry != impl_->factor_ids.end()) {
+            auto& target = *impl_->factors[factor_entry->second];
+            const std::unique_lock factor_lock(target.mutex);
+            write(target, contract_entry->second);
+            return;
+        }
+    }
+
+    const std::unique_lock catalog_lock(impl_->catalog_mutex);
+    const auto contract_id = impl_->get_or_add_contract(contract);
     impl_->write_factor(factor, [&](Factor& target) {
-        target.write_block(key, [&](YearBlock& block) { block.merge(indexed); });
+        write(target, contract_id);
     });
 }
 
@@ -534,35 +631,70 @@ void FactorStore::upsert_day(TradingDate date,
 
     std::vector<BlockKey> keys;
     keys.reserve(contracts.size());
-    const std::unique_lock lock(impl_->mutex);
+    const auto write_row = [&](Factor& target, std::size_t offset) {
+        for (std::size_t c = 0; c < keys.size(); ++c) {
+            target.write_block(keys[c], [&](YearBlock& block) {
+                if (block.upsert(indexed.day, values[offset + c])) {
+                    impl_->promotions.enqueue(block, target);
+                }
+            });
+        }
+    };
+    {
+        const std::shared_lock catalog_lock(impl_->catalog_mutex);
+        for (const auto& contract : contracts) {
+            const auto entry = impl_->contract_ids.find(contract);
+            if (entry == impl_->contract_ids.end()) {
+                break;
+            }
+            keys.push_back(block_key(entry->second, indexed.year));
+        }
+        if (keys.size() == contracts.size()) {
+            std::vector<FactorId> ids;
+            ids.reserve(factors.size());
+            for (const auto& factor : factors) {
+                const auto entry = impl_->factor_ids.find(factor);
+                if (entry == impl_->factor_ids.end()) {
+                    break;
+                }
+                ids.push_back(entry->second);
+            }
+            if (ids.size() == factors.size()) {
+                {
+                    const auto locks = impl_->lock_factors<std::unique_lock<std::shared_mutex>>(ids);
+                    for (std::size_t f = 0; f < ids.size(); ++f) {
+                        write_row(*impl_->factors[ids[f]], f * keys.size());
+                    }
+                }
+                impl_->promotions.run_after_daily_write(cell_count);
+                return;
+            }
+        }
+    }
+
+    // Recheck names under exclusive access because the catalog may have changed.
+    const std::unique_lock catalog_lock(impl_->catalog_mutex);
+    keys.clear();
     for (const auto& contract : contracts) {
         keys.push_back(block_key(impl_->get_or_add_contract(contract), indexed.year));
     }
 
     std::size_t offset = 0;
     for (const auto& factor : factors) {
-        impl_->write_factor(factor, [&](Factor& target) {
-            for (std::size_t c = 0; c < keys.size(); ++c) {
-                target.write_block(keys[c], [&](YearBlock& block) {
-                    if (block.upsert(indexed.day, values[offset + c])) {
-                        impl_->promotions.enqueue(block);
-                    }
-                });
-            }
-        });
+        impl_->write_factor(factor, [&](Factor& target) { write_row(target, offset); });
         offset += keys.size();
     }
     impl_->promotions.run_after_daily_write(cell_count);
 }
 
 std::size_t FactorStore::factor_count() const {
-    const std::shared_lock lock(impl_->mutex);
+    const std::shared_lock lock(impl_->catalog_mutex);
     return impl_->factors.size();
 }
 
 bool FactorStore::erase_factor(std::string_view factor) {
     validate_name(factor);
-    const std::unique_lock lock(impl_->mutex);
+    const std::unique_lock lock(impl_->catalog_mutex);
     const auto entry = impl_->factor_ids.find(factor);
     if (entry == impl_->factor_ids.end()) {
         return false;
@@ -613,11 +745,14 @@ QueryResult FactorStore::query(const std::vector<std::string>& factors,
 
     std::vector<std::optional<ContractId>> contracts_by_position;
     contracts_by_position.reserve(contracts.size());
+    std::vector<const Factor*> factors_by_position;
+    factors_by_position.reserve(factors.size());
+    std::vector<FactorId> ids;
+    ids.reserve(factors.size());
     result.values.resize(cell_count);
     result.validity.resize(word_count);
 
-    // Hold a shared lock from resolving names through filling the last result cell.
-    const std::shared_lock lock(impl_->mutex);
+    const std::shared_lock catalog_lock(impl_->catalog_mutex);
     for (const auto& contract : contracts) {
         const auto entry = impl_->contract_ids.find(contract);
         contracts_by_position.push_back(entry == impl_->contract_ids.end()
@@ -625,12 +760,23 @@ QueryResult FactorStore::query(const std::vector<std::string>& factors,
                                             : std::optional<ContractId>(entry->second));
     }
 
-    for (std::size_t f = 0; f < factors.size(); ++f) {
-        const auto entry = impl_->factor_ids.find(factors[f]);
+    for (const auto& factor : factors) {
+        const auto entry = impl_->factor_ids.find(factor);
         if (entry == impl_->factor_ids.end()) {
+            factors_by_position.push_back(nullptr);
+        } else {
+            ids.push_back(entry->second);
+            factors_by_position.push_back(impl_->factors[entry->second].get());
+        }
+    }
+
+    // Lock the whole read set before visiting any block.
+    const auto locks = impl_->lock_factors<std::shared_lock<std::shared_mutex>>(std::move(ids));
+    for (std::size_t f = 0; f < factors.size(); ++f) {
+        if (!factors_by_position[f]) {
             continue;
         }
-        const auto& blocks = impl_->factors[entry->second]->blocks;
+        const auto& blocks = factors_by_position[f]->blocks;
         for (std::size_t c = 0; c < contracts.size(); ++c) {
             const auto contract_id = contracts_by_position[c];
             if (!contract_id) {

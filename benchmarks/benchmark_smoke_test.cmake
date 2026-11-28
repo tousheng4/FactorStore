@@ -48,24 +48,26 @@ if(NOT isolated_status EQUAL 0 OR NOT isolated_output MATCHES
     message(FATAL_ERROR "Unexpected isolated benchmark output: ${isolated_output}")
 endif()
 
-execute_process(
-    COMMAND "${BENCHMARK}" --case concurrent-mixed --profile small --samples 3
-    RESULT_VARIABLE concurrent_status
-    OUTPUT_VARIABLE concurrent_output
-    TIMEOUT 10
-)
 set(concurrent_rows
     "concurrent-read-alone,small,3,16384,64,0"
     "concurrent-write-alone,small,3,512,64,-"
     "concurrent-read-mixed,small,6,16384,64,0"
     "concurrent-write-mixed,small,3,512,64,-"
 )
-string(REPLACE "\r" "" concurrent_output "${concurrent_output}")
-foreach(row IN LISTS concurrent_rows)
-    if(NOT concurrent_status EQUAL 0 OR NOT concurrent_output MATCHES
-        "(^|\n)${row},[0-9.]+,[0-9.]+,[0-9.]+,${rss}\n")
-        message(FATAL_ERROR "Missing concurrent benchmark row: ${row}\n${concurrent_output}")
-    endif()
+foreach(scenario IN ITEMS concurrent-mixed concurrent-disjoint)
+    execute_process(
+        COMMAND "${BENCHMARK}" --case "${scenario}" --profile small --samples 3
+        RESULT_VARIABLE concurrent_status
+        OUTPUT_VARIABLE concurrent_output
+        TIMEOUT 10
+    )
+    string(REPLACE "\r" "" concurrent_output "${concurrent_output}")
+    foreach(row IN LISTS concurrent_rows)
+        if(NOT concurrent_status EQUAL 0 OR NOT concurrent_output MATCHES
+            "(^|\n)${row},[0-9.]+,[0-9.]+,[0-9.]+,${rss}\n")
+            message(FATAL_ERROR "Missing ${scenario} row: ${row}\n${concurrent_output}")
+        endif()
+    endforeach()
 endforeach()
 
 execute_process(

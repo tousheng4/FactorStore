@@ -32,6 +32,7 @@ using Clock = std::chrono::steady_clock;
 constexpr unsigned seed = 20261127;
 constexpr std::size_t days_per_year = 252;
 constexpr std::string_view concurrent_case = "concurrent-mixed";
+constexpr std::string_view disjoint_case = "concurrent-disjoint";
 
 enum class Shape { annual, daily, history_query, day_query, mixed_query, promotion_query };
 
@@ -78,7 +79,7 @@ Options parse_options(int argc, char** argv) {
         if (argument == "--case") {
             const auto known = std::any_of(scenarios.begin(), scenarios.end(),
                                            [&](const Scenario& s) { return s.name == value; });
-            if (!known && value != "all" && value != concurrent_case) {
+            if (!known && value != "all" && value != concurrent_case && value != disjoint_case) {
                 throw std::invalid_argument("unknown case: " + std::string(value));
             }
             options.selected_case = value;
@@ -397,11 +398,17 @@ void concurrent(const Options& options, const std::vector<std::string>& factors,
     constexpr std::size_t requested_days = 32;
     const auto dates = weekdays(2024, 0);
     const std::vector<TradingDate> requested(dates.begin(), dates.begin() + requested_days);
+    const auto writer_factors = options.selected_case == disjoint_case
+                                    ? names("writer_factor_", factors.size())
+                                    : factors;
     const auto values = generate_values(factors.size() * contracts.size());
     const auto read_cells = values.size() * requested.size();
     FactorStore store;
     for (std::size_t i = 0; i < stored_days; ++i) {
         store.upsert_day(dates[i], factors, contracts, values);
+        if (options.selected_case == disjoint_case) {
+            store.upsert_day(dates[i], writer_factors, contracts, values);
+        }
     }
 
     const auto read = [&](bool) {
@@ -415,7 +422,7 @@ void concurrent(const Options& options, const std::vector<std::string>& factors,
     };
     const auto write = [&](bool) {
         const auto begin = Clock::now();
-        store.upsert_day(dates.front(), factors, contracts, values);
+        store.upsert_day(dates.front(), writer_factors, contracts, values);
         return microseconds_since(begin);
     };
     print_measurement("concurrent-read-alone", stored_days, options,
@@ -457,7 +464,7 @@ void run(const Options& options) {
     std::cout.imbue(std::locale::classic());
     std::cout << "case,profile,samples,cells_per_batch,stored_days_per_block,missing_percent,"
                  "p50_us,p95_us,cells_per_second,peak_rss_kib\n";
-    if (options.selected_case == concurrent_case) {
+    if (options.selected_case == concurrent_case || options.selected_case == disjoint_case) {
         concurrent(options, factors, contracts);
         return;
     }
@@ -486,7 +493,7 @@ int main(int argc, char** argv) {
         for (const auto& scenario : scenarios) {
             std::cout << ", " << scenario.name;
         }
-        std::cout << ", " << concurrent_case << " (run separately)\n";
+        std::cout << ", " << concurrent_case << ", " << disjoint_case << " (run separately)\n";
         return 0;
     }
     try {

@@ -13,7 +13,7 @@ taskset -c 3 ./build-bench/benchmarks/factor_store_benchmarks \
   --case query-mixed-dense --profile large --samples 61
 ```
 
-`--help` 列出全部场景。`--case` 默认执行全部单线程场景，读写混合场景单独用 `--case concurrent-mixed` 启动。`--profile` 默认为 `small`，`--samples` 默认为 31。需要逐场景的峰值内存时，为每个场景启动一次新的进程。CPU 编号按本机可用范围选择。
+`--help` 列出全部场景。`--case` 默认执行全部单线程场景，`concurrent-mixed` 和 `concurrent-disjoint` 分别测量读写因子完全重叠与完全不重叠的场景。`--profile` 默认为 `small`，`--samples` 默认为 31。需要逐场景的峰值内存时，为每个场景启动一次新的进程。CPU 编号按本机可用范围选择。
 
 ## 负载与测量口径
 
@@ -231,7 +231,7 @@ for order in 'baseline optimized' 'optimized baseline' 'baseline optimized'; do
 done
 ```
 
-## 读写混合负载
+## 实例级锁的读写混合基线
 
 使用同一实例和同一组数据，分别测单独执行与混合执行。每个年度块预写 64 日，查询读取其中 32 日，日写覆盖已有的一天。混合场景由两个读取线程和一个写入线程同时启动。每个线程先预热一次，再分别采集 101 次调用。计时包含 API 内的准备、锁等待和访问数据。
 
@@ -254,3 +254,40 @@ taskset -c 2,3,4 ./build-bench/benchmarks/factor_store_benchmarks \
 ```
 
 Release CTest 四项通过，并发用例连续运行 20 次。并发用例也通过 ASan、UBSan 和 TSan。本次在 WSL 上用 `setarch x86_64 -R` 仅对 TSan 测试进程关闭地址随机化后运行检查。
+
+## 因子级锁对比
+
+以实例级锁提交 `ce47518` 为基线，使用同一个基准程序对比因子级锁。两个读线程和一个写线程共用同一实例。每个块预写 64 日，查询取其中 32 日，单日写入覆盖已有的一天。完全不重叠的场景额外预写一组同规模的因子供写线程使用，合约、日期和单批值数与重叠场景相同。测量针对已有因子和合约，不包含新名称登记、删除或稀疏块转换。
+
+在 WSL2、AMD Ryzen 9 7940H 和 GCC 13.3.0 环境中使用 `-O3 -DNDEBUG`，将进程限制在逻辑 CPU 2、4、6。每种负载运行九轮，每轮交替前后版本的运行顺序。每个线程预热一次，再采集 101 次调用。下表为混合执行的结果，取各轮 P50 和 P95 的中位数，单位为 µs。
+
+| 规模 | 读写因子 | 操作 | 实例级锁 P50 / P95 | 因子级锁 P50 / P95 |
+| --- | --- | --- | ---: | ---: |
+| small | 完全重叠 | 查询 | 35.84 / 81.86 | 36.25 / 147.33 |
+| small | 完全重叠 | 日写 | 7.96 / 106.13 | 8.24 / 293.28 |
+| small | 完全不重叠 | 查询 | 36.05 / 107.00 | 36.34 / 50.23 |
+| small | 完全不重叠 | 日写 | 8.05 / 139.15 | 8.15 / 9.05 |
+| large | 完全重叠 | 查询 | 909.69 / 2421.63 | 1003.84 / 2212.00 |
+| large | 完全重叠 | 日写 | 925.13 / 2452.56 | 1011.85 / 2473.31 |
+| large | 完全不重叠 | 查询 | 1416.61 / 2599.10 | 619.67 / 1574.32 |
+| large | 完全不重叠 | 日写 | 1431.48 / 2711.99 | 120.23 / 187.48 |
+
+大型场景中，不重叠的日写 P95 从 2.71 ms 降到 0.19 ms。完全重叠时，查询和日写仍争用同一组因子锁，大型日写 P95 约为 2.47 ms。小规模完全重叠的 P95 在各轮之间波动较大，九轮中位数也高于实例级锁。
+
+从仓库根目录构建两个版本，保持基准程序和编译选项一致。复测小规模时将 `large` 换成 `small`。
+
+```bash
+scratch=$(mktemp -d)
+git show ce47518:src/factor_store.cpp > "$scratch/baseline.cpp"
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
+  benchmarks/factor_store_benchmark.cpp "$scratch/baseline.cpp" -o "$scratch/baseline"
+g++ -std=c++17 -pthread -O3 -DNDEBUG -Iinclude \
+  benchmarks/factor_store_benchmark.cpp src/factor_store.cpp -o "$scratch/factor-locks"
+for scenario in concurrent-mixed concurrent-disjoint; do
+  for version in baseline factor-locks; do
+    taskset -c 2,4,6 "$scratch/$version" --case "$scenario" --profile large --samples 101
+  done
+done
+```
+
+因子级锁版本的 Release CTest 四项通过，并发用例连续运行 20 次。带并发转换用例的测试也通过了 ASan、UBSan 和 TSan。

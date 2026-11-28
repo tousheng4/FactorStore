@@ -58,6 +58,8 @@ void run_with_two_readers(Read read, Write write) {
 void test_query_observes_one_complete_batch() {
     FactorStore store;
     const std::vector<std::string> factors{"first", "second", "third"};
+    const std::vector<std::string> read_factors{"third", "second", "first", "third"};
+    const std::vector<std::string> write_factors(factors.rbegin(), factors.rend());
     const auto codes = contracts();
     const std::vector<TradingDate> dates{date};
     const auto cells = factors.size() * codes.size();
@@ -67,10 +69,11 @@ void test_query_observes_one_complete_batch() {
     run_with_two_readers(
         [&] {
             for (int i = 0; i < iterations; ++i) {
-                const auto result = store.query(factors, codes, dates);
-                check(result.values.size() == cells, "wrong query size");
+                const auto result = store.query(read_factors, codes, dates);
+                const auto read_cells = read_factors.size() * codes.size();
+                check(result.values.size() == read_cells, "wrong query size");
                 const auto value = result.values.front();
-                for (std::size_t j = 0; j < cells; ++j) {
+                for (std::size_t j = 0; j < read_cells; ++j) {
                     check(result.has_value(j) && result.values[j] == value,
                           "query observed a partially applied batch");
                 }
@@ -80,7 +83,7 @@ void test_query_observes_one_complete_batch() {
         [&] {
             for (int i = 1; i <= iterations; ++i) {
                 std::fill(updates.begin(), updates.end(), static_cast<double>(i));
-                store.upsert_day(date, factors, codes, updates);
+                store.upsert_day(date, i % 2 == 0 ? factors : write_factors, codes, updates);
             }
         });
 
@@ -156,6 +159,50 @@ void test_annual_and_daily_writers_share_a_block() {
     check(store.factor_count() == 1, "concurrent writers created duplicate factors");
 }
 
+void test_promotion_during_writes_to_other_factors() {
+    FactorStore store;
+    const auto codes = contracts();
+    const std::vector<std::string> pending{"pending"};
+    const std::vector<std::string> active{"active"};
+    const std::array<int, 7> days_per_month{31, 29, 31, 30, 31, 30, 10};
+    constexpr TradingDate last_day = 20240710;
+    const std::vector<double> original(codes.size(), 1.0);
+    for (std::size_t month = 0; month < days_per_month.size(); ++month) {
+        for (int day = 1; day <= days_per_month[month]; ++day) {
+            const auto trading_date = 20240000 + static_cast<int>(month + 1) * 100 + day;
+            store.upsert_day(trading_date, pending, codes, original);
+        }
+    }
+    store.upsert_day(date, active, codes, original);
+
+    std::promise<void> start;
+    const auto gate = start.get_future().share();
+    auto annual = std::async(std::launch::async, [&, gate] {
+        gate.get();
+        for (auto code = codes.rbegin(); code != codes.rend(); ++code) {
+            store.upsert_year(pending.front(), *code, 2024, {{last_day, 2.0}});
+        }
+    });
+    start.set_value();
+    for (int i = 0; i < iterations; ++i) {
+        store.upsert_day(date, active, codes, original);
+        const auto result = store.query(pending, codes, {date, last_day});
+        for (std::size_t c = 0; c < codes.size(); ++c) {
+            const auto first = c * 2;
+            check(result.has_value(first) && result.values[first] == 1.0 &&
+                      result.has_value(first + 1) &&
+                      (result.values[first + 1] == 1.0 || result.values[first + 1] == 2.0),
+                  "queued promotion lost sparse or overwritten values");
+        }
+    }
+    annual.get();
+
+    const auto result = store.query(pending, codes, {last_day});
+    for (std::size_t c = 0; c < codes.size(); ++c) {
+        check(result.has_value(c) && result.values[c] == 2.0, "annual overwrite was lost");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -163,6 +210,7 @@ int main() {
         test_query_observes_one_complete_batch();
         test_query_during_delete_and_recreate();
         test_annual_and_daily_writers_share_a_block();
+        test_promotion_during_writes_to_other_factors();
     } catch (const std::exception& error) {
         std::cerr << "Concurrent FactorStore test failed: " << error.what() << '\n';
         return 1;

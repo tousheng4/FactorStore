@@ -112,7 +112,7 @@ double
 - 多个线程同时查询同一个因子。
 - 多个线程同时写入不同因子。
 - 同一个因子的读写操作正确互斥。
-- 使用 shared_ptr 和逻辑删除机制保证对象生命周期安全。
+- 在访问因子期间持有目录锁，删除时独占目录，确保因子对象在使用期间有效。
 - 通过统一的加锁顺序避免循环等待。
 
 后续如果发现同一个因子内部存在较大的锁竞争，可以进一步引入分片锁。
@@ -155,7 +155,7 @@ data/
 | 开发环境 | WSL2 + Ubuntu           |
 | 构建工具 | CMake + Ninja           |
 | 数据结构 | HashMap、Vector、Bitmap   |
-| 并发控制 | shared_mutex、shared_ptr |
+| 并发控制 | shared_mutex、mutex |
 | 磁盘存储 | 自定义二进制文件、POSIX I/O      |
 | 单元测试 | GoogleTest              |
 | 性能测试 | Google Benchmark        |
