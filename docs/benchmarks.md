@@ -13,7 +13,7 @@ taskset -c 3 ./build-bench/benchmarks/factor_store_benchmarks \
   --case query-mixed-dense --profile large --samples 61
 ```
 
-`--help` 列出 12 个场景，`--case` 默认执行全部，`--profile` 默认为 `small`，`--samples` 默认为 31。需要逐场景的峰值内存时，为每个场景启动一次新的进程。CPU 编号按本机可用范围选择。
+`--help` 列出全部场景，`--case` 默认执行全部，`--profile` 默认为 `small`，`--samples` 默认为 31。需要逐场景的峰值内存时，为每个场景启动一次新的进程。CPU 编号按本机可用范围选择。
 
 ## 负载与测量口径
 
@@ -88,14 +88,15 @@ taskset -c 3 ./build-bench/benchmarks/factor_store_benchmarks \
 ```bash
 scratch=$(mktemp -d)
 git show c551385:src/factor_store.cpp > "$scratch/sparse.cpp"
-sed 's/dense_threshold = 192;/dense_threshold = 1;/' src/factor_store.cpp \
+git show 2ec688c:src/factor_store.cpp > "$scratch/hybrid.cpp"
+sed 's/dense_threshold = 192;/dense_threshold = 1;/' "$scratch/hybrid.cpp" \
   > "$scratch/dense.cpp"
 g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
   "$scratch/sparse.cpp" -o "$scratch/sparse"
 g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
   "$scratch/dense.cpp" -o "$scratch/dense"
 g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
-  src/factor_store.cpp -o "$scratch/hybrid"
+  "$scratch/hybrid.cpp" -o "$scratch/hybrid"
 
 for order in 'sparse hybrid dense' 'hybrid dense sparse' 'dense sparse hybrid'; do
   for layout in $order; do
@@ -107,3 +108,80 @@ done
 ## 正确性验证
 
 最终 Release 构建的 CTest 三项通过。闰年回归覆盖单日写入跨阈值、年度批次直接创建稠密块和两个小批次合并跨阈值。用例检查了缺失、零值、NaN 和覆盖行为。核心单元测试通过 ASan 与 UBSan。
+
+## 分块批量查询对照
+
+这组结果比较同样的混合存储布局，基线是提交 `2ec688c` 的逐日期查询，优化版在每个块内选择一次读取路径。稀疏块在每年请求至少 24 个日期、且请求数量达到块内日期数量约四分之一时采用顺序归并。该门槛是当前的调优取值，适合随负载复测。
+
+在 WSL2 中用 GCC 13.3.0 构建，两版均使用 `-O3 -DNDEBUG`，固定在逻辑 CPU 3。每个规模和场景交替运行三轮，每轮 61 批。表中为三轮对应指标的中位数，延迟单位为 µs。
+
+| 规模 | 场景 | P50 基线 → 优化 | P95 基线 → 优化 | P50 降幅 |
+| --- | --- | ---: | ---: | ---: |
+| small | `query-history` | 50.56 → 42.88 | 63.09 → 46.21 | 15.2% |
+| small | `query-day` | 4.02 → 3.98 | 4.21 → 4.52 | 1.0% |
+| small | `query-mixed-sparse` | 142.21 → 60.22 | 214.22 → 81.52 | 57.7% |
+| small | `query-mixed-dense` | 70.60 → 61.10 | 99.00 → 84.30 | 13.5% |
+| small | `query-mixed-dense-25` | 77.11 → 68.16 | 138.21 → 106.31 | 11.6% |
+| large | `query-history` | 203.02 → 173.91 | 265.26 → 211.30 | 14.3% |
+| large | `query-day` | 57.68 → 55.62 | 75.28 → 69.72 | 3.6% |
+| large | `query-mixed-sparse` | 2999.69 → 1215.98 | 4484.68 → 3142.28 | 59.5% |
+| large | `query-mixed-dense` | 4156.69 → 3668.68 | 5695.34 → 5132.55 | 11.7% |
+| large | `query-mixed-dense-25` | 4398.37 → 4227.53 | 6637.90 → 4848.91 | 3.9% |
+
+稀疏无序查询的 P50 降幅最大，两种规模均超过 57%。跨年历史查询同样受益。单日点查的 P50 大致持平，小规模单日点查的 P95 略有增加。高密度、低缺失率场景的耗时波动较大。
+
+下列命令使用同一份基准程序，对比逐日期查询的基线与当前实现。若当前实现已包含分批转换，结果会反映两项优化的组合效果，上表只衡量分块查询优化。命令需在包含基线提交的 Git 工作副本中执行。
+
+```bash
+scratch=$(mktemp -d)
+git show 2ec688c:src/factor_store.cpp > "$scratch/baseline.cpp"
+g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
+  "$scratch/baseline.cpp" -o "$scratch/baseline"
+g++ -std=c++17 -O3 -DNDEBUG -Iinclude benchmarks/factor_store_benchmark.cpp \
+  src/factor_store.cpp -o "$scratch/optimized"
+for order in 'baseline optimized' 'optimized baseline' 'baseline optimized'; do
+  for version in $order; do
+    taskset -c 3 "$scratch/$version" --case query-mixed-sparse --profile large --samples 61
+  done
+done
+```
+
+## 分批转换对照
+
+基线为分块查询优化完成后、仍执行即时转换的版本。最终版按日写批次消化转换队列，等待中的块仍可继续读写。每批预算为 `min(256, ceil(写入值数 / 16))`。每个合约都跨过阈值时，`small` 首批转换 32 个块，`large` 首批转换 256 个块。
+
+`query-promotion-pending` 和 `query-promotion-drained` 写入完全相同的一年 192 日数据，请求同样的 32 个日期，缺失率同为 50%。前者在跨阈值日写结束后立即查询，后者先对同一日做 32 批同值覆盖，给队列时间清空。该设置只改变查询前的转换进度。
+
+两版使用同一份基准程序，GCC 13.3.0、`-O3 -DNDEBUG`、WSL2 的逻辑 CPU 3。每个场景交替执行三轮，每轮 31 批。下表为各指标的三轮中位数，由即时转换指向最终版。延迟单位为 µs。
+
+| 规模 | 场景 | P50 即时 → 分批 | P95 即时 → 分批 | 峰值 RSS MiB |
+| --- | --- | ---: | ---: | ---: |
+| small | `day-new` | 28.22 → 32.55 | 43.66 → 51.22 | 3.90 → 3.91 |
+| small | `day-append` | 12.23 → 8.30 | 15.69 → 11.33 | 4.53 → 4.54 |
+| small | `day-overwrite` | 10.18 → 9.83 | 12.32 → 12.31 | 4.54 → 4.54 |
+| small | `day-threshold` | 239.34 → 34.73 | 337.79 → 47.63 | 5.20 → 4.92 |
+| small | `query-mixed-dense` | 60.49 → 61.43 | 75.30 → 76.51 | 6.96 → 6.96 |
+| small | `query-promotion-pending` | 25.42 → 56.66 | 65.44 → 109.83 | 5.18 → 5.13 |
+| small | `query-promotion-drained` | 25.28 → 25.73 | 48.63 → 42.27 | 5.23 → 5.31 |
+| large | `day-new` | 446.51 → 439.69 | 537.47 → 546.05 | 4.77 → 4.91 |
+| large | `day-append` | 324.71 → 174.93 | 659.70 → 432.50 | 12.35 → 12.36 |
+| large | `day-overwrite` | 213.68 → 212.22 | 576.83 → 471.98 | 12.35 → 12.35 |
+| large | `day-threshold` | 4408.68 → 295.68 | 5946.71 → 533.16 | 22.35 → 20.14 |
+| large | `query-mixed-dense` | 3611.72 → 3564.64 | 4404.86 → 6167.21 | 43.50 → 43.69 |
+| large | `query-promotion-pending` | 766.33 → 1865.70 | 2282.02 → 3451.82 | 23.88 → 21.71 |
+| large | `query-promotion-drained` | 939.82 → 793.74 | 2177.36 → 2039.04 | 23.86 → 23.98 |
+
+- 6,144 个块同时跨阈值时，日写 P95 从约 5.95 ms 降到 0.53 ms，降幅 91%。普通顺序追加也从跳过不必要的二分查找中受益。
+- 排队仍有读成本。大型场景查询 P50 从即时转换的约 0.77 ms 增至 1.87 ms。清空队列后，分批版的同负载 P50 回到约 0.79 ms。等待中的块对较大的请求较早采用顺序归并，以减少重复二分。
+- 此组大型常规高密度查询的 P50 接近，P95 从 4.40 ms 增至 6.17 ms。该场景的尾延迟跨轮波动明显，仍需结合目标负载复测。
+
+用本文开头的 Release 命令构建后，可运行以下三个场景。
+
+```bash
+for scenario in day-threshold query-promotion-pending query-promotion-drained; do
+  taskset -c 3 ./build-bench/benchmarks/factor_store_benchmarks \
+    --case "$scenario" --profile large --samples 31
+done
+```
+
+最终 Release 的三项 CTest 均通过，功能用例覆盖待转换块的查询、年度写入完成转换、删除与同名重建，以及无关日写推进队列。核心单元测试同时通过 ASan 和 UBSan。

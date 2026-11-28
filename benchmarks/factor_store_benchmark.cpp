@@ -29,16 +29,17 @@ using Clock = std::chrono::steady_clock;
 constexpr unsigned seed = 20261127;
 constexpr std::size_t days_per_year = 252;
 
-enum class Shape { annual, daily, history_query, day_query, mixed_query };
+enum class Shape { annual, daily, history_query, day_query, mixed_query, promotion_query };
 
 struct Scenario {
     std::string_view name;
     Shape shape;
     std::size_t stored_days;
     std::size_t missing_dates_per_year = 0;
+    bool drain_promotions = false;
 };
 
-constexpr std::array<Scenario, 12> scenarios{{
+constexpr std::array<Scenario, 14> scenarios{{
     {"year-new", Shape::annual, 0},
     {"year-overwrite", Shape::annual, days_per_year},
     {"year-backfill", Shape::annual, 189},
@@ -51,6 +52,8 @@ constexpr std::array<Scenario, 12> scenarios{{
     {"query-mixed-sparse", Shape::mixed_query, 32, 16},
     {"query-mixed-dense", Shape::mixed_query, 224, 16},
     {"query-mixed-dense-25", Shape::mixed_query, 224, 8},
+    {"query-promotion-pending", Shape::promotion_query, 192, 16},
+    {"query-promotion-drained", Shape::promotion_query, 192, 16, true},
 }};
 
 struct Options {
@@ -253,7 +256,7 @@ void build_query_year(const Scenario& scenario, const std::vector<TradingDate>& 
                        [offset](double value) { return value + offset; });
         store.upsert_day(date, factors, contracts, day_values);
     };
-    if (scenario.shape != Shape::mixed_query) {
+    if (scenario.missing_dates_per_year == 0) {
         for (std::size_t i = 0; i < scenario.stored_days; ++i) {
             load(year[i]);
             requested.push_back({year[i], true});
@@ -268,21 +271,29 @@ void build_query_year(const Scenario& scenario, const std::vector<TradingDate>& 
     }
     constexpr std::size_t request_count = 32;
     const auto hits = request_count - scenario.missing_dates_per_year;
+    const bool sparsely_loaded = scenario.stored_days == request_count;
+    const auto loaded_range = sparsely_loaded ? available.size() : scenario.stored_days;
     for (std::size_t i = 0; i < request_count; ++i) {
-        const auto date = available[i * available.size() / request_count];
+        const auto date = available[i * loaded_range / request_count];
         if (i < hits) {
             requested.push_back({date, true});
         }
-        if (scenario.stored_days == request_count) {
+        if (sparsely_loaded) {
             load(date);
         }
     }
     for (std::size_t i = 0; i < scenario.missing_dates_per_year; ++i) {
         requested.push_back({absent[i * absent.size() / scenario.missing_dates_per_year], false});
     }
-    if (scenario.stored_days != request_count) {
-        for (const auto date : available) {
-            load(date);
+    if (!sparsely_loaded) {
+        for (std::size_t i = 0; i < loaded_range; ++i) {
+            load(available[i]);
+        }
+    }
+    if (scenario.drain_promotions) {
+        // These batches overwrite the same values, giving pending promotions time to finish.
+        for (int i = 0; i < 32; ++i) {
+            load(available.front());
         }
     }
 }
@@ -295,14 +306,16 @@ Measurement query(const Scenario& scenario, const Options& options,
                              : all_factors;
     const auto values = generate_values(factors.size() * contracts.size());
     const std::array<std::vector<TradingDate>, 2> years{weekdays(2024, 0), weekdays(2025, 2)};
-    const auto year_count = scenario.shape == Shape::day_query ? 1U : years.size();
+    const bool single_year = scenario.shape == Shape::day_query ||
+                             scenario.shape == Shape::promotion_query;
+    const auto year_count = single_year ? 1U : years.size();
 
     FactorStore store;
     std::vector<RequestedDate> requested;
     for (std::size_t y = 0; y < year_count; ++y) {
         build_query_year(scenario, years[y], factors, contracts, values, store, requested);
     }
-    if (scenario.shape == Shape::mixed_query) {
+    if (scenario.missing_dates_per_year != 0) {
         permute(requested);
     }
     std::vector<TradingDate> dates;

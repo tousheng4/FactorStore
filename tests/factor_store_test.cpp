@@ -139,8 +139,7 @@ void test_empty_and_invalid_batches() {
                   {"new", "existing"}, {"IF", "IC"}, {20240229, 20250102});
 }
 
-void test_full_leap_year() {
-    FactorStore store;
+std::vector<TradingDate> leap_year_dates() {
     std::vector<TradingDate> dates;
     const std::array<int, 12> month_lengths{31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
     for (std::size_t month = 0; month < month_lengths.size(); ++month) {
@@ -148,6 +147,12 @@ void test_full_leap_year() {
             dates.push_back(20000000 + (static_cast<int>(month) + 1) * 100 + day);
         }
     }
+    return dates;
+}
+
+void test_full_leap_year() {
+    FactorStore store;
+    auto dates = leap_year_dates();
     Model expected;
     std::vector<DailyValue> annual;
     for (std::size_t i = 0; i < dates.size(); ++i) {
@@ -169,9 +174,52 @@ void test_full_leap_year() {
     store.upsert_year("factor", "contract", 2000, {{20001231, 42.0}, {20000101, 43.0}});
     expected[{"factor", "contract", 20001231}] = 42.0;
     expected[{"factor", "contract", 20000101}] = 43.0;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    store.upsert_year("sparse", "contract", 2000, {{20000101, 0.0}, {20000229, nan}});
+    expected[{"sparse", "contract", 20000101}] = 0.0;
+    expected[{"sparse", "contract", 20000229}] = nan;
     std::reverse(dates.begin(), dates.end());
     dates.push_back(20010101);
-    compare_query(store, expected, {"factor", "annual", "merged"}, {"contract"}, dates);
+    dates.push_back(20000229);
+    dates.push_back(20000101);
+    compare_query(store, expected, {"sparse", "factor", "annual", "merged"}, {"contract"}, dates);
+}
+
+void test_pending_promotions_survive_writes_and_factor_deletion() {
+    FactorStore store;
+    const auto dates = leap_year_dates();
+    std::vector<std::string> contracts;
+    for (int i = 0; i < 40; ++i) {
+        contracts.push_back("contract_" + std::to_string(i));
+    }
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<std::string> factors{"removed", "kept"};
+    std::vector<double> values(factors.size() * contracts.size(), 1.0);
+    values[contracts.size()] = nan;
+    values.back() = 0.0;
+    for (std::size_t i = 0; i < 192; ++i) {
+        store.upsert_day(dates[i], factors, contracts, values);
+    }
+
+    const std::vector<std::string> selected{contracts.front(), contracts.back()};
+    const std::vector<TradingDate> probes{dates[191], dates[192], dates[0]};
+    Model expected{{{"kept", contracts.front(), dates[191]}, nan},
+                   {{"kept", contracts.front(), dates[0]}, nan},
+                   {{"kept", contracts.back(), dates[191]}, 0.0},
+                   {{"kept", contracts.back(), dates[0]}, 0.0}};
+    compare_query(store, expected, {"kept"}, selected, probes);
+
+    check(store.erase_factor("removed"), "failed to delete a factor with queued blocks");
+    store.upsert_year("kept", contracts.back(), 2000, {{dates[0], 42.0}, {dates[192], 43.0}});
+    store.upsert_day(dates[192], {"removed"}, {contracts.front()}, {99.0});
+    for (std::size_t i = 0; i < contracts.size(); ++i) {
+        store.upsert_day(dates[i], {"unrelated"}, {"other_contract"}, {1.0});
+    }
+    expected[{"kept", contracts.back(), dates[0]}] = 42.0;
+    expected[{"kept", contracts.back(), dates[192]}] = 43.0;
+    expected[{"removed", contracts.front(), dates[192]}] = 99.0;
+    compare_query(store, expected, {"removed", "kept"}, selected, probes);
+    check(store.factor_count() == 3, "unexpected factor count after recreation");
 }
 
 void test_delete_and_name_ownership() {
@@ -266,6 +314,7 @@ int main() {
         test_batches_and_query_order();
         test_empty_and_invalid_batches();
         test_full_leap_year();
+        test_pending_promotions_survive_writes_and_factor_deletion();
         test_delete_and_name_ownership();
         test_randomized_reference_model();
     } catch (const std::exception& error) {

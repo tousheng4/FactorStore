@@ -5,6 +5,7 @@
 #include <bitset>
 #include <deque>
 #include <limits>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
@@ -21,6 +22,8 @@ using BlockKey = std::uint64_t;
 
 constexpr std::size_t max_days_in_year = 366;
 constexpr std::size_t dense_threshold = 192;
+constexpr std::size_t max_promotions_per_daily_batch = 256;
+constexpr std::size_t cells_per_promotion = 16;
 
 struct IndexedDate {
     int year;
@@ -97,6 +100,38 @@ struct IndexedValue {
     double value;
 };
 
+struct QueryDay {
+    DayIndex day;
+    std::size_t position;
+};
+
+struct QueryDays {
+    void add(DayIndex day, std::size_t position) {
+        if (!days.empty() && day < days.back().day) {
+            sorted = false;
+        }
+        days.push_back({day, position});
+    }
+
+    void sort_if_needed() {
+        if (!sorted) {
+            // Reorder traversal without changing any request's output position.
+            std::sort(days.begin(), days.end(), [](const auto& a, const auto& b) {
+                return a.day < b.day;
+            });
+            sorted = true;
+        }
+    }
+
+    std::vector<QueryDay> days;
+    bool sorted = true;
+};
+
+void set_query_value(QueryResult& result, std::size_t position, double value) noexcept {
+    result.values[position] = value;
+    result.validity[position / 64] |= std::uint64_t{1} << (position % 64);
+}
+
 struct DenseBlock {
     std::array<double, max_days_in_year> values{};
     std::bitset<max_days_in_year> present;
@@ -107,36 +142,78 @@ struct DenseBlock {
     }
 };
 
-class YearBlock {
-public:
-    [[nodiscard]] std::optional<double> find(DayIndex day) const {
-        if (dense_) {
-            return dense_->present[day] ? std::optional<double>(dense_->values[day]) : std::nullopt;
-        }
-        const auto position = std::lower_bound(days_.begin(), days_.end(), day);
-        if (position == days_.end() || *position != day) {
-            return std::nullopt;
-        }
-        return values_[position - days_.begin()];
+// Links live in map nodes, whose addresses stay stable when the map rehashes.
+struct PromotionLink {
+    PromotionLink() = default;
+    PromotionLink(const PromotionLink&) = delete;
+    PromotionLink& operator=(const PromotionLink&) = delete;
+
+    [[nodiscard]] bool linked() const noexcept {
+        return next != this;
     }
 
-    void upsert(DayIndex day, double value) {
-        if (dense_) {
-            dense_->upsert(day, value);
+    void unlink() noexcept {
+        if (linked()) {
+            previous->next = next;
+            next->previous = previous;
+            previous = this;
+            next = this;
+        }
+    }
+
+    PromotionLink* previous = this;
+    PromotionLink* next = this;
+};
+
+class YearBlock : private PromotionLink {
+public:
+    ~YearBlock() {
+        unlink();
+    }
+
+    void read_many(QueryDays& requested, std::size_t offset, QueryResult& result) const {
+        if (const auto* dense = dense_.get()) {
+            for (const auto& request : requested.days) {
+                if (dense->present[request.day]) {
+                    set_query_value(result, offset + request.position, dense->values[request.day]);
+                }
+            }
             return;
         }
-        const auto position = std::lower_bound(days_.begin(), days_.end(), day);
+
+        // For many requested dates, amortize a single pass over the sparse block.
+        constexpr std::size_t min_merge_dates = 24;
+        if (requested.days.size() >= min_merge_dates &&
+            (requested.days.size() >= days_.size() / 4 ||
+             (linked() && requested.days.size() >= days_.size() / 8))) {
+            requested.sort_if_needed();
+            read_sparse_in_order(requested.days, offset, result);
+            return;
+        }
+
+        for (const auto& request : requested.days) {
+            const auto day = std::lower_bound(days_.begin(), days_.end(), request.day);
+            if (day != days_.end() && *day == request.day) {
+                set_query_value(result, offset + request.position, values_[day - days_.begin()]);
+            }
+        }
+    }
+
+    // A new date that crosses the threshold makes this block eligible for the queue.
+    bool upsert(DayIndex day, double value) {
+        if (dense_) {
+            dense_->upsert(day, value);
+            return false;
+        }
+        const auto position = days_.empty() || day > days_.back()
+                                  ? days_.end()
+                                  : std::lower_bound(days_.begin(), days_.end(), day);
         const auto index = position - days_.begin();
         if (position != days_.end() && *position == day) {
             values_[index] = value;
-            return;
+            return false;
         }
 
-        if (days_.size() + 1 >= dense_threshold) {
-            promote();
-            dense_->upsert(day, value);
-            return;
-        }
         if (days_.size() == days_.capacity() || values_.size() == values_.capacity()) {
             const auto capacity = std::min(max_days_in_year, 2 * days_.size() + 1);
             // Complete both allocations before changing either array's length.
@@ -145,6 +222,7 @@ public:
         }
         days_.insert(days_.begin() + index, day);
         values_.insert(values_.begin() + index, value);
+        return days_.size() == dense_threshold;
     }
 
     void merge(const std::vector<IndexedValue>& points) {
@@ -181,10 +259,33 @@ public:
         if (merged.days_.size() >= dense_threshold) {
             merged.promote();
         }
-        *this = std::move(merged);
+        days_.swap(merged.days_);
+        values_.swap(merged.values_);
+        dense_.swap(merged.dense_);
+        if (dense_) {
+            unlink();
+        }
     }
 
 private:
+    friend class PromotionQueue;
+
+    void read_sparse_in_order(const std::vector<QueryDay>& requested, std::size_t offset,
+                              QueryResult& result) const {
+        auto day = std::lower_bound(days_.begin(), days_.end(), requested.front().day);
+        for (const auto& request : requested) {
+            while (day != days_.end() && *day < request.day) {
+                ++day;
+            }
+            if (day == days_.end()) {
+                break;
+            }
+            if (*day == request.day) {
+                set_query_value(result, offset + request.position, values_[day - days_.begin()]);
+            }
+        }
+    }
+
     void promote() {
         auto dense = std::make_unique<DenseBlock>();
         for (std::size_t i = 0; i < days_.size(); ++i) {
@@ -194,6 +295,7 @@ private:
         dense_ = std::move(dense);
         std::vector<DayIndex>().swap(days_);
         std::vector<double>().swap(values_);
+        unlink();
     }
 
     void append(DayIndex day, double value) {
@@ -204,6 +306,33 @@ private:
     std::vector<DayIndex> days_;
     std::vector<double> values_;
     std::unique_ptr<DenseBlock> dense_;
+};
+
+class PromotionQueue {
+public:
+    void enqueue(YearBlock& block) noexcept {
+        block.previous = head_.previous;
+        block.next = &head_;
+        head_.previous->next = &block;
+        head_.previous = &block;
+    }
+
+    void run_after_daily_write(std::size_t cells) noexcept {
+        const auto budget = std::min(max_promotions_per_daily_batch,
+                                     1 + (cells - 1) / cells_per_promotion);
+        for (std::size_t i = 0; i < budget && head_.next != &head_; ++i) {
+            auto& block = static_cast<YearBlock&>(*head_.next);
+            try {
+                block.promote();
+            } catch (const std::bad_alloc&) {
+                // The write already succeeded. Leave this block queued and readable.
+                return;
+            }
+        }
+    }
+
+private:
+    PromotionLink head_;
 };
 
 struct Factor {
@@ -226,14 +355,11 @@ struct Factor {
     std::unordered_map<BlockKey, YearBlock, BlockKeyHash> blocks;
 };
 
-struct QueryDay {
-    DayIndex day;
-    std::size_t position;
-};
-
 }  // namespace
 
 struct FactorStore::Impl {
+    // Destroy the factors and their links before destroying the queue sentinel.
+    PromotionQueue promotions;
     // The owner containers keep strings stable even when the index tables rehash.
     std::deque<std::string> contract_names;
     std::unordered_map<std::string_view, ContractId> contract_ids;
@@ -344,12 +470,15 @@ void FactorStore::upsert_day(TradingDate date,
         impl_->write_factor(factor, [&](Factor& target) {
             for (std::size_t c = 0; c < keys.size(); ++c) {
                 target.write_block(keys[c], [&](YearBlock& block) {
-                    block.upsert(indexed.day, values[offset + c]);
+                    if (block.upsert(indexed.day, values[offset + c])) {
+                        impl_->promotions.enqueue(block);
+                    }
                 });
             }
         });
         offset += keys.size();
     }
+    impl_->promotions.run_after_daily_write(cell_count);
 }
 
 std::size_t FactorStore::factor_count() const {
@@ -400,10 +529,10 @@ QueryResult FactorStore::query(const std::vector<std::string>& factors,
         throw std::length_error("query result exceeds buffer capacity");
     }
 
-    std::unordered_map<int, std::vector<QueryDay>> by_year;
+    std::unordered_map<int, QueryDays> by_year;
     for (std::size_t d = 0; d < dates.size(); ++d) {
         const auto date = parse_date(dates[d]);
-        by_year[date.year].push_back({date.day, d});
+        by_year[date.year].add(date.day, d);
     }
 
     std::vector<std::optional<ContractId>> contracts_by_position;
@@ -429,18 +558,12 @@ QueryResult FactorStore::query(const std::vector<std::string>& factors,
                 continue;
             }
             const auto offset = (f * contracts.size() + c) * dates.size();
-            for (const auto& [year, days] : by_year) {
+            for (auto& [year, days] : by_year) {
                 const auto block = blocks.find(block_key(*contract_id, year));
                 if (block == blocks.end()) {
                     continue;
                 }
-                for (const auto& day : days) {
-                    if (const auto value = block->second.find(day.day)) {
-                        const auto position = offset + day.position;
-                        result.values[position] = *value;
-                        result.validity[position / 64] |= std::uint64_t{1} << (position % 64);
-                    }
-                }
+                block->second.read_many(days, offset, result);
             }
         }
     }
